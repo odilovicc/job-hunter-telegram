@@ -15,6 +15,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.request import HTTPXRequest
 from database import db
 from filters import level_1_filter, level_2_scoring
 from ai_generator import generate_cover_letter, create_ai_client, FALLBACK_COVER_LETTER
@@ -111,6 +112,10 @@ network_mode = network_cfg.get("mode", "direct")
 
 telethon_kwargs = {}
 gemini_http_options = None
+# base_url/headers для Bot API (python-telegram-bot) через воркер — None означает
+# "обычный прямой api.telegram.org", как раньше.
+ptb_base_url = None
+ptb_proxy_headers = None
 
 if network_mode == "cloudflare_worker":
     cf_cfg = network_cfg["cloudflare_worker"]
@@ -133,6 +138,12 @@ if network_mode == "cloudflare_worker":
         base_url=f"{worker_base}/gemini",
         headers={"X-Proxy-Token": proxy_token},
     )
+    # Bot API (getMe/sendMessage/getUpdates и т.д.) — это обычный HTTPS с явным
+    # SNI api.telegram.org, который многие DPI блокируют отдельно от MTProto.
+    # Раньше это не проксировалось вообще, из-за чего Telethon работал, а
+    # python-telegram-bot падал с ConnectTimeout/TimedOut на getMe().
+    ptb_base_url = f"{worker_base}/telegram-bot/bot"
+    ptb_proxy_headers = {"X-Proxy-Token": proxy_token}
     log.info(f"Режим сети: cloudflare_worker ({worker_base})")
 else:
     log.info("Режим сети: direct")
@@ -522,13 +533,35 @@ async def authorize_telethon():
         return False
 
 
+def build_ptb_application():
+    """Собирает Application для Bot API, с маршрутизацией через Cloudflare Worker,
+    если он включён (network.mode == "cloudflare_worker").
+
+    python-telegram-bot держит ДВА отдельных HTTP-клиента внутри Bot:
+    один для обычных вызовов (sendMessage и т.д.), другой — только для
+    getUpdates при long polling. Если настроить только .request(), второй клиент
+    молча создаётся с дефолтными настройками без заголовка X-Proxy-Token — и
+    long polling по-прежнему будет биться о ConnectTimeout напрямую в api.telegram.org.
+    Поэтому задаём оба клиента явно, с одинаковыми заголовками.
+    """
+    builder = Application.builder().token(ADMIN_BOT_TOKEN)
+
+    if ptb_base_url:
+        builder = builder.base_url(ptb_base_url)
+        request_kwargs = {"httpx_kwargs": {"headers": ptb_proxy_headers}}
+        builder = builder.request(HTTPXRequest(**request_kwargs))
+        builder = builder.get_updates_request(HTTPXRequest(**request_kwargs))
+
+    return builder.build()
+
+
 async def main(mode="normal"):
     await client.connect()
 
     if not await authorize_telethon():
         return
 
-    ptb_app = Application.builder().token(ADMIN_BOT_TOKEN).build()
+    ptb_app = build_ptb_application()
     ptb_app.add_handler(CommandHandler("start", start_handler))
     ptb_app.add_handler(CallbackQueryHandler(button_handler))
     ptb_app.add_error_handler(error_handler)

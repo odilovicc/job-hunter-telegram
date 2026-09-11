@@ -11,8 +11,12 @@
  *               Telegram — иначе воркер превратился бы в открытый TCP-релей
  *               в любую точку интернета.
  *   /gemini/* — обычный HTTP reverse-proxy на generativelanguage.googleapis.com.
+ *   /telegram-bot/* — обычный HTTP reverse-proxy на api.telegram.org, для
+ *               Bot API (python-telegram-bot). Нужен отдельно от /mtproto,
+ *               т.к. Bot API — это обычный HTTPS с чётким SNI api.telegram.org,
+ *               который многие DPI блокируют независимо от MTProto.
  *
- * Оба маршрута защищены общим секретом (заголовок X-Proxy-Token), который
+ * Все маршруты защищены общим секретом (заголовок X-Proxy-Token), который
  * задаётся через `wrangler secret put PROXY_TOKEN` и должен совпадать со
  * значением network.cloudflare_worker.proxy_token в config.yaml бота.
  */
@@ -125,14 +129,14 @@ async function handleMtproto(request, env) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-async function handleGemini(request, env) {
+async function proxyTo(request, env, { stripPrefix, upstreamOrigin }) {
   if (!isAuthorized(request, env)) {
     return new Response("Forbidden", { status: 403 });
   }
 
   const url = new URL(request.url);
-  const upstreamPath = url.pathname.replace(/^\/gemini/, "") || "/";
-  const upstreamUrl = "https://generativelanguage.googleapis.com" + upstreamPath + url.search;
+  const upstreamPath = url.pathname.replace(stripPrefix, "") || "/";
+  const upstreamUrl = upstreamOrigin + upstreamPath + url.search;
 
   const headers = new Headers(request.headers);
   headers.delete("X-Proxy-Token");
@@ -153,6 +157,20 @@ async function handleGemini(request, env) {
   });
 }
 
+async function handleGemini(request, env) {
+  return proxyTo(request, env, {
+    stripPrefix: /^\/gemini/,
+    upstreamOrigin: "https://generativelanguage.googleapis.com",
+  });
+}
+
+async function handleTelegramBot(request, env) {
+  return proxyTo(request, env, {
+    stripPrefix: /^\/telegram-bot/,
+    upstreamOrigin: "https://api.telegram.org",
+  });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -162,6 +180,9 @@ export default {
     }
     if (url.pathname.startsWith("/gemini")) {
       return handleGemini(request, env);
+    }
+    if (url.pathname.startsWith("/telegram-bot")) {
+      return handleTelegramBot(request, env);
     }
     return new Response("Not found", { status: 404 });
   },
