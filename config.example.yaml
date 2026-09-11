@@ -1,0 +1,153 @@
+telegram:
+  api_id: 
+  api_hash: ""
+  channels:
+    - "rabota_uz"
+    - "ayti_jobs"
+    - "unilance"
+    - "kasbdoruz"
+    - "Exampleuz"
+    - "thetechkz"
+    - "freelance_link"
+    - "aumetajobs_tashkent"
+    - "UzjobsUz"
+    - "huntmeglobal"
+    - "ish_qidiring"
+    - "joblinkuz"
+    - "IshLink_uz"
+    - "freelance_uzb"
+    - "upjobsuz"
+    - "edustaffs"
+    - "Toshkent_ish_rasmiy"
+    - "TanishBilishHR"
+    - "frontEndJobo"
+    - "data_ish"
+    - "ProKadr_uz"
+    - "ejobs_uz"
+    - "jobforjunior"
+    - "jobs_juniors_remote"
+    - "juno_jobs"
+    - "young_june"
+    - "juniors_rabota_jobs"
+    - "jobmarket_uz"
+    - "frontendVacancy"
+
+user_profile:
+  resume_path: "resume.pdf"
+  position: "Middle Vue / Junior PHP Developer"
+
+filters:
+  level_1_keywords:
+    # Вакансия пройдет на Уровень 2, если содержит ХОТЯ БЫ ОДНО слово из include
+    include:
+      - "vue"
+      - "vue.js"
+      - "vuejs"
+      - "vue 3"
+      - "nuxt"
+      - "nuxt.js"
+      - "nuxt 3"
+      - "frontend"
+      - "front-end"
+      - "фронтенд"
+      - "фронт-енд"
+      - "laravel"
+      - "php"
+      - "javascript"
+      - "typescript"
+      - "node.js"
+    
+    # Вакансия будет ОТКЛОНЕНА, если содержит ХОТЯ БЫ ОДНО слово из exclude
+    exclude:
+      - "senior"
+      - "синьор"
+      - "сеньор"
+      - "lead"
+      - "лид"
+      - "cto"
+      - "react"
+      - "angular"
+      - "svelte"
+      - "kotlin"
+      - "spring"
+      - "java разработчик"
+      - "java developer"
+      - "java программист"
+      - "ruby"
+      - "ios"
+      - "android"
+      - "преподаватель"
+      - "ментор"
+
+  level_2_scoring:
+    min_pass_score: 5
+    rules:
+      # --- График и формат работы ---
+      - pattern: "удален(ка|ная|но|ку)"
+        score: 3
+        label: "удалёнка"
+      - pattern: "remote"
+        score: 3
+        label: "remote"
+      - pattern: "гибрид"
+        score: 1
+        label: "гибрид"
+      - pattern: "офис"
+        score: 0
+        label: "офис"
+      - pattern: "(?<!\\d)5/2(?!\\d)"
+        score: 2
+        label: "5/2"
+      - pattern: "(?<!\\d)6/1(?!\\d)"
+        score: 1
+        label: "6/1"
+      - pattern: "part-time"
+        score: 1
+        label: "part-time"
+      
+      # --- Технологии (бонусные баллы, если стек идеальный) ---
+      - pattern: "vue 3"
+        score: 1
+        label: "Vue 3"
+      - pattern: "nuxt 3"
+        score: 1
+        label: "Nuxt 3"
+      - pattern: "typescript"
+        score: 1
+        label: "TypeScript"
+      - pattern: "tailwind"
+        score: 1
+        label: "Tailwind"
+      
+      # --- Опыт ---
+      - pattern: "middle"
+        score: 2
+        label: "middle"
+      - pattern: "мидл"
+        score: 2
+        label: "мидл"
+      - pattern: "миддл"
+        score: 2
+        label: "миддл"
+      - pattern: "junior"
+        score: 1
+        label: "junior"
+      - pattern: "джуниор"
+        score: 1
+        label: "джуниор"
+      - pattern: "джун"
+        score: 1
+        label: "джун"
+
+ai:
+  gemini_api_key: ""
+  prompt_template: |
+    Ты — профессиональный программист. Твоя специализация: Vue Frontend (Middle) и PHP/Laravel (Junior).
+    Вот текст вакансии:
+    {vacancy_text}
+
+    Напиши короткое, убедительное и вежливое сопроводительное письмо (максимум 70-100 слов) для отклика на эту вакансию от моего лица.
+    - Покажи, что ты понимаешь, кого они ищут.
+    - Обязательно упомяни, что мое резюме прикреплено к сообщению.
+    - Пиши уверенно, но без высокомерия и без лишней "воды".
+    - Пиши на том же языке, на котором написана вакансия.

@@ -1,0 +1,15 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Secrets & Session
+config.yaml
+*.session
+*.session-journal
+
+# Database
+bot_state.db
+
+# Logs
+bot.log

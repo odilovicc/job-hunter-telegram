@@ -1,0 +1,4 @@
+telethon
+qrcode
+google-genai
+pyyaml
