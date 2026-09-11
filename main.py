@@ -593,7 +593,10 @@ async def main(mode="normal"):
         raise SystemExit(f"Bot API недоступен ({e}). Проверьте admin_bot.bot_token и сеть.")
 
     await ptb_app.start()
-    await ptb_app.updater.start_polling(drop_pending_updates=True)
+    await ptb_app.updater.start_polling(
+        drop_pending_updates=True,
+        timeout=50
+    )
 
     # Обработчик регистрируем только после того, как канал доставки проверен.
     @client.on(events.NewMessage(chats=config["telegram"]["channels"]))
