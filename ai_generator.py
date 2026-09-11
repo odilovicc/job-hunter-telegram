@@ -21,7 +21,7 @@ def generate_cover_letter(vacancy_text, config, ai_client):
 
     try:
         response = ai_client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-3.6-flash',
             contents=prompt,
         )
         return response.text.strip()

@@ -13,6 +13,10 @@ network:
 telegram:
   api_id:
   api_hash: ""
+
+admin_bot:
+  bot_token: ""   # токен от @BotFather
+  chat_id:        # числовой chat_id администратора (можно узнать через @userinfobot)
   channels:
     - "rabota_uz"
     - "ayti_jobs"

@@ -3,3 +3,4 @@ qrcode
 google-genai
 pyyaml
 websockets
+python-telegram-bot[ext]
