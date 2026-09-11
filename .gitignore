@@ -12,4 +12,7 @@ config.yaml
 bot_state.db
 
 # Logs
-bot.log
+bot.log*
+
+# Personal resume (contains PII, don't push to a public repo)
+resume.pdf

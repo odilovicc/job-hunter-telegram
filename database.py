@@ -1,9 +1,12 @@
+import os
 import sqlite3
-import json
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 class Database:
     def __init__(self, db_name="bot_state.db"):
-        self.conn = sqlite3.connect(db_name)
+        db_path = os.path.join(BASE_DIR, db_name)
+        self.conn = sqlite3.connect(db_path)
         self.cursor = self.conn.cursor()
         self.setup()
 
@@ -18,12 +21,18 @@ class Database:
             )
         ''')
         # Баг #6: Хранение pending_applications в БД, а не в памяти
+        # PRIMARY KEY составной (message_id, chat_id) — id сообщений у каждого
+        # канала своя независимая последовательность, поэтому одного message_id
+        # недостаточно: вакансии из разных каналов с одинаковым id перезаписывали
+        # друг друга, и кнопка могла отправить письмо не тому HR.
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS pending_applications (
-                message_id INTEGER PRIMARY KEY,
+                message_id INTEGER,
+                chat_id INTEGER,
                 author TEXT,
                 cover_letter TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (message_id, chat_id)
             )
         ''')
         self.conn.commit()
@@ -44,27 +53,27 @@ class Database:
 
     # --- Pending Applications ---
 
-    def save_pending(self, message_id, author, cover_letter):
+    def save_pending(self, message_id, chat_id, author, cover_letter):
         self.cursor.execute(
-            'INSERT OR REPLACE INTO pending_applications (message_id, author, cover_letter) VALUES (?, ?, ?)',
-            (message_id, author, cover_letter)
+            'INSERT OR REPLACE INTO pending_applications (message_id, chat_id, author, cover_letter) VALUES (?, ?, ?, ?)',
+            (message_id, chat_id, author, cover_letter)
         )
         self.conn.commit()
 
-    def get_pending(self, message_id):
+    def get_pending(self, message_id, chat_id):
         self.cursor.execute(
-            'SELECT author, cover_letter FROM pending_applications WHERE message_id = ?',
-            (message_id,)
+            'SELECT author, cover_letter FROM pending_applications WHERE message_id = ? AND chat_id = ?',
+            (message_id, chat_id)
         )
         row = self.cursor.fetchone()
         if row:
             return {"author": row[0], "cover_letter": row[1]}
         return None
 
-    def delete_pending(self, message_id):
+    def delete_pending(self, message_id, chat_id):
         self.cursor.execute(
-            'DELETE FROM pending_applications WHERE message_id = ?',
-            (message_id,)
+            'DELETE FROM pending_applications WHERE message_id = ? AND chat_id = ?',
+            (message_id, chat_id)
         )
         self.conn.commit()
 

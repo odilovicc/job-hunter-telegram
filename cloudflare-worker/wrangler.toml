@@ -1,0 +1,6 @@
+name = "job-hunter-telegram-relay"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+# TCP Sockets API (`cloudflare:sockets`, использован в src/index.js для
+# /mtproto) требует плана Workers, поддерживающего исходящие TCP-сокеты.

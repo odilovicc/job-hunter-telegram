@@ -1,5 +1,17 @@
+# Как бот ходит в сеть: "direct" — обычные прямые соединения (по умолчанию).
+# "cloudflare_worker" — и Telegram (MTProto), и Gemini API идут через
+# Cloudflare Worker. Нужно, если хостинг ограничивает прямой доступ к
+# Telegram/Google (например, сервер в РФ). Разверните воркер из
+# cloudflare-worker/ (см. cloudflare-worker/README.md) и укажите его адрес
+# ниже — переключение туда-обратно делается только сменой mode.
+network:
+  mode: "direct"  # "direct" | "cloudflare_worker"
+  cloudflare_worker:
+    base_url: "https://your-worker.your-subdomain.workers.dev"
+    proxy_token: ""  # тот же секрет, что в `wrangler secret put PROXY_TOKEN`
+
 telegram:
-  api_id: 
+  api_id:
   api_hash: ""
   channels:
     - "rabota_uz"
