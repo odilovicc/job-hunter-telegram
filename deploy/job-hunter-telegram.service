@@ -1,0 +1,34 @@
+# Systemd unit для запуска бота на Linux-сервере фоном, с автозапуском при
+# загрузке сервера и автоперезапуском при падении процесса.
+#
+# Установка:
+#   1. Замените YOUR_USER и /home/YOUR_USER/job-hunter-telegram на реальные значения.
+#   2. sudo cp deploy/job-hunter-telegram.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now job-hunter-telegram
+#
+# Полезные команды:
+#   sudo systemctl status job-hunter-telegram   # статус
+#   sudo journalctl -u job-hunter-telegram -f   # логи в реальном времени
+#   sudo systemctl restart job-hunter-telegram  # перезапуск
+#
+# Первый запуск (авторизация по QR-коду) нужно сделать ВРУЧНУЮ в терминале
+# (python main.py), не через systemd — иначе некому будет сканировать QR.
+# Файл bot_session.session после этого сохранится, и systemd сможет
+# запускать бота уже без интерактивного входа.
+
+[Unit]
+Description=Job Hunter Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/job-hunter-telegram
+ExecStart=/home/YOUR_USER/job-hunter-telegram/venv/bin/python main.py
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

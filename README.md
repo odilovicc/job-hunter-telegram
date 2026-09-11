@@ -99,6 +99,9 @@ pip install -r requirements.txt
 4. В блоке `ai` вставьте ваш `gemini_api_key`.
 5. Поместите файл с вашим резюме в папку с проектом и назовите его `resume.pdf` (или укажите другой путь в `resume_path`).
 6. Настройте блоки `include`, `exclude` и `rules` под свои навыки.
+7. (Опционально) Если хостинг бота ограничивает прямой доступ к Telegram/Google
+   (например, сервер в РФ), поставьте `network.mode: "cloudflare_worker"` —
+   см. `cloudflare-worker/README.md` для деплоя релея.
 
 ---
 
