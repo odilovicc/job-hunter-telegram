@@ -44,6 +44,30 @@ class Database:
                 PRIMARY KEY (message_id, chat_id)
             )
         ''')
+        # Журнал воронки вакансий, прошедших Уровень 1, для /stats: какие оценены
+        # Уровнем 2, какой исход у прошедших (отправлено/пропущено/ждёт решения).
+        # Уровень 1 сюда не пишется поштучно (отсеивает почти всё, было бы
+        # раздувало БД) — для него есть отдельный простой счётчик в counters.
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS vacancy_log (
+                message_id INTEGER,
+                chat_id INTEGER,
+                channel_username TEXT,
+                score INTEGER,
+                level2_passed INTEGER NOT NULL,
+                outcome TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                decided_at TIMESTAMP,
+                PRIMARY KEY (message_id, chat_id)
+            )
+        ''')
+        # Общие счётчики для /stats и алертов (level1_rejected, gemini_fallback и т.п.)
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS counters (
+                name TEXT PRIMARY KEY,
+                value INTEGER NOT NULL DEFAULT 0
+            )
+        ''')
         self.conn.commit()
         self._migrate_legacy_schema()
 
@@ -157,6 +181,104 @@ class Database:
             (message_id, chat_id)
         )
         self.conn.commit()
+
+    # --- Статистика (vacancy_log / counters), для /stats ---
+
+    def log_candidate(self, message_id, chat_id, channel_username, score, passed):
+        """Фиксирует вакансию, прошедшую Уровень 1 (была оценена на Уровне 2).
+        outcome ставится 'rejected', если не прошла, или 'pending', если прошла
+        (дальше обновится на 'sent'/'skipped' через set_vacancy_outcome).
+        INSERT OR REPLACE — повторная обработка той же вакансии (например,
+        после неудачной доставки отчёта и повторной попытки) просто перезапишет запись.
+        """
+        outcome = "pending" if passed else "rejected"
+        self.cursor.execute(
+            '''INSERT OR REPLACE INTO vacancy_log
+               (message_id, chat_id, channel_username, score, level2_passed, outcome, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, COALESCE(
+                   (SELECT created_at FROM vacancy_log WHERE message_id = ? AND chat_id = ?),
+                   CURRENT_TIMESTAMP
+               ))''',
+            (message_id, chat_id, channel_username, score, int(passed), outcome, message_id, chat_id)
+        )
+        self.conn.commit()
+
+    def set_vacancy_outcome(self, message_id, chat_id, outcome):
+        """outcome: 'sent' или 'skipped'. Ничего не делает, если записи нет —
+        такое возможно, если vacancy_log был добавлен после того, как заявка
+        уже висела в pending_applications из старой версии бота.
+        """
+        self.cursor.execute(
+            'UPDATE vacancy_log SET outcome = ?, decided_at = CURRENT_TIMESTAMP '
+            'WHERE message_id = ? AND chat_id = ?',
+            (outcome, message_id, chat_id)
+        )
+        self.conn.commit()
+
+    def increment_counter(self, name, by=1):
+        self.cursor.execute(
+            'INSERT INTO counters (name, value) VALUES (?, ?) '
+            'ON CONFLICT(name) DO UPDATE SET value = value + excluded.value',
+            (name, by)
+        )
+        self.conn.commit()
+
+    def get_counter(self, name):
+        self.cursor.execute('SELECT value FROM counters WHERE name = ?', (name,))
+        row = self.cursor.fetchone()
+        return row[0] if row else 0
+
+    def get_stats(self, recent_limit=8):
+        """Собирает агрегированную статистику для /stats."""
+        c = self.conn.execute('SELECT COUNT(*) FROM vacancy_log')
+        total_candidates = c.fetchone()[0]
+
+        c = self.conn.execute('SELECT COUNT(*) FROM vacancy_log WHERE level2_passed = 1')
+        passed_level2 = c.fetchone()[0]
+
+        c = self.conn.execute('SELECT COUNT(*) FROM vacancy_log WHERE level2_passed = 0')
+        rejected_level2 = c.fetchone()[0]
+
+        c = self.conn.execute(
+            "SELECT outcome, COUNT(*) FROM vacancy_log WHERE level2_passed = 1 GROUP BY outcome"
+        )
+        outcome_counts = {"sent": 0, "skipped": 0, "pending": 0}
+        for outcome, cnt in c.fetchall():
+            outcome_counts[outcome] = cnt
+
+        c = self.conn.execute('SELECT AVG(score) FROM vacancy_log WHERE level2_passed = 1')
+        avg_score_row = c.fetchone()[0]
+        avg_score = round(avg_score_row, 1) if avg_score_row is not None else None
+
+        c = self.conn.execute(
+            "SELECT COALESCE(channel_username, '?'), COUNT(*) FROM vacancy_log "
+            "WHERE level2_passed = 1 GROUP BY channel_username ORDER BY COUNT(*) DESC LIMIT 3"
+        )
+        top_channels = c.fetchall()
+
+        c = self.conn.execute(
+            'SELECT message_id, chat_id, channel_username, score, created_at FROM vacancy_log '
+            'WHERE level2_passed = 0 ORDER BY created_at DESC LIMIT ?',
+            (recent_limit,)
+        )
+        recent_rejected = [
+            {"message_id": r[0], "chat_id": r[1], "channel_username": r[2], "score": r[3], "created_at": r[4]}
+            for r in c.fetchall()
+        ]
+
+        return {
+            "level1_rejected": self.get_counter("level1_rejected"),
+            "total_candidates": total_candidates,
+            "passed_level2": passed_level2,
+            "rejected_level2": rejected_level2,
+            "sent": outcome_counts["sent"],
+            "skipped": outcome_counts["skipped"],
+            "awaiting_decision": outcome_counts["pending"],
+            "avg_score": avg_score,
+            "top_channels": top_channels,
+            "recent_rejected": recent_rejected,
+            "gemini_fallback": self.get_counter("gemini_fallback"),
+        }
 
 
 db = Database()

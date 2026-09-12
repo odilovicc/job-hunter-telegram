@@ -8,8 +8,13 @@ config.yaml
 *.session
 *.session-journal
 
-# Database
+# Database (включая WAL/SHM-сидкары sqlite и любые тестовые *.db рядом)
 bot_state.db
+
+bot_state.db-shm
+bot_state.db-wal
+*.db-shm
+*.db-wal
 
 # Logs
 bot.log*

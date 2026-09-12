@@ -4,12 +4,14 @@ import html
 import logging
 import os
 import time
+import traceback
 import yaml
 import qrcode
 import re
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient, events
+from telethon.utils import get_peer_id
 from google.genai import types as genai_types
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -163,6 +165,118 @@ ai_client = create_ai_client(config["ai"]["gemini_api_key"], http_options=gemini
 # Множество юзернеймов каналов (lower, без @) для фильтрации в extract_contact
 channel_usernames = {ch.lstrip("@").lower() for ch in config["telegram"]["channels"]}
 
+# chat_id (marked id вида -100xxxxxxxxxx) -> username канала, для ссылок в /stats.
+# Заполняется один раз при старте (см. build_channel_username_map) — не резолвим
+# на каждое сообщение, чтобы не дёргать Telethon лишний раз.
+channel_username_by_chat_id = {}
+
+
+def message_link(chat_id, msg_id):
+    """Формирует t.me-ссылку на сообщение для отчётов/статистики.
+
+    Если username канала известен — обычная публичная ссылка (открывается у
+    кого угодно). Если нет — ссылка вида t.me/c/<id>/<msg>, которая работает
+    только у тех, кто уже состоит в этом канале/группе (fallback на случай
+    приватных чатов или сбоя резолвинга).
+    """
+    username = channel_username_by_chat_id.get(chat_id)
+    if username:
+        return f"https://t.me/{username}/{msg_id}"
+    s = str(chat_id)
+    internal_id = s[4:] if s.startswith("-100") else s.lstrip("-")
+    return f"https://t.me/c/{internal_id}/{msg_id}"
+
+
+async def build_channel_username_map():
+    """Резолвит username всех каналов из конфига в их chat_id один раз при
+    старте — нужно для ссылок на сообщения в /stats и в отчётах."""
+    for uname in config["telegram"]["channels"]:
+        clean = uname.lstrip("@")
+        try:
+            entity = await client.get_entity(clean)
+            channel_username_by_chat_id[get_peer_id(entity)] = clean
+        except Exception as e:
+            log.warning(f"Не удалось получить entity канала {clean} для ссылок в /stats: {e}")
+
+
+# --- Алерты в Telegram при ошибках (Gemini, Bot API, Telethon, необработанные
+# исключения) ---
+#
+# Идея: не расставлять notify_admin() по всем местам вручную, а повесить
+# обработчик логов на наш собственный логгер "vacancy_bot" (его используют
+# main.py, database.py, ai_generator.py, filters.py). Тогда КАЖДЫЙ существующий
+# и будущий log.error()/log.exception() автоматически долетает админу в
+# Telegram, а не только в bot.log на сервере, куда для просмотра нужно идти
+# через SSH.
+_admin_bot_ref: dict = {"bot": None}  # {"bot": Optional[Bot]} — без аннотации типизатор сужает её до dict[str, None]
+_pending_alert_tasks = set()
+
+
+def _make_standalone_bot():
+    """Bot, независимый от жизненного цикла ptb_app — нужен, чтобы отправлять
+    алерты даже до того, как основной Application проинициализирован (или
+    после того, как он уже остановлен, например при фатальном падении)."""
+    if ptb_base_url:
+        return Bot(
+            token=ADMIN_BOT_TOKEN,
+            base_url=ptb_base_url,
+            request=HTTPXRequest(httpx_kwargs={"headers": ptb_proxy_headers}),
+        )
+    return Bot(token=ADMIN_BOT_TOKEN)
+
+
+async def notify_admin(text):
+    """Шлёт HTML-текст админу. Любая ошибка при отправке гасится и логируется
+    через log.warning (НЕ log.error) — иначе сбой самой отправки алерта мог бы
+    зациклить TelegramAlertHandler сам на себя."""
+    running_bot = _admin_bot_ref.get("bot")
+    try:
+        if running_bot is not None:
+            await running_bot.send_message(chat_id=ADMIN_CHAT_ID, text=text[:4000], parse_mode=ParseMode.HTML)
+        else:
+            async with _make_standalone_bot() as tmp_bot:
+                await tmp_bot.send_message(chat_id=ADMIN_CHAT_ID, text=text[:4000], parse_mode=ParseMode.HTML)
+    except Exception as e:
+        log.warning(f"Не удалось отправить алерт админу: {e}")
+
+
+class TelegramAlertHandler(logging.Handler):
+    """Дублирует ERROR/CRITICAL-логи бота админу в Telegram.
+
+    Не блокирует и не роняет логирование: если нет запущенного event loop
+    (например, самый ранний старт скрипта) — алерт молча теряется, но в
+    bot.log запись всё равно останется благодаря остальным хендлерам.
+    """
+
+    DEDUPE_WINDOW_SEC = 300  # не чаще раза в 5 минут на одинаковый (логгер, сообщение)
+
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self._last_sent = {}
+
+    def emit(self, record):
+        try:
+            key = (record.name, record.getMessage())
+            now = time.monotonic()
+            last = self._last_sent.get(key)
+            if last is not None and now - last < self.DEDUPE_WINDOW_SEC:
+                return
+            self._last_sent[key] = now
+
+            text = self.format(record)
+            loop = asyncio.get_running_loop()
+        except Exception:
+            return
+
+        icon = "🆘" if record.levelno >= logging.CRITICAL else "⚠️"
+        alert_text = f"{icon} <b>Ошибка в боте</b> ({html.escape(record.name)})\n<pre>{html.escape(text[:3500])}</pre>"
+        task = loop.create_task(notify_admin(alert_text))
+        _pending_alert_tasks.add(task)
+        task.add_done_callback(_pending_alert_tasks.discard)
+
+
+log.addHandler(TelegramAlertHandler())
+
 # Сериализация обращений к Gemini (см. GEMINI_MIN_INTERVAL_SEC).
 # Lock создаётся лениво, а не на уровне модуля: до Python 3.10
 # asyncio.Lock() привязывается к текущему event loop в момент создания, а на
@@ -215,9 +329,11 @@ async def generate_letter(vacancy_text):
 
     # generate_cover_letter сам глотает ошибки и возвращает заглушку, поэтому
     # распознаём фолбэк по содержимому — админу важно знать, что письмо шаблонное.
-    if not letter or not letter.strip():
+    is_fallback = not letter or not letter.strip() or letter.strip() == FALLBACK_COVER_LETTER.strip()
+    if is_fallback:
+        db.increment_counter("gemini_fallback")
         return FALLBACK_COVER_LETTER, True
-    return letter, letter.strip() == FALLBACK_COVER_LETTER.strip()
+    return letter, False
 
 
 def build_keyboard(chat_id, msg_id, has_contact):
@@ -328,6 +444,9 @@ async def handle_message(message, bot: Bot):
     # Уровень 1: Быстрый фильтр
     if not level_1_filter(vacancy_text, config):
         log.debug("   ❌ Уровень 1: не прошёл фильтр ключевых слов")
+        # Без ссылок на конкретные сообщения — объём слишком большой (почти всё,
+        # что пишут каналы), для /stats достаточно одного счётчика.
+        db.increment_counter("level1_rejected")
         return
 
     log.info(f"   ✅ Уровень 1 пройден! id={message.id}")
@@ -335,15 +454,20 @@ async def handle_message(message, bot: Bot):
     # Уровень 2: Оценка алгоритмом
     score, is_passed, breakdown = level_2_scoring(vacancy_text, config)
     breakdown_str = ", ".join(breakdown) if breakdown else "нет совпадений"
+    channel_username = channel_username_by_chat_id.get(message.chat_id)
 
     if not is_passed:
         log.info(
             f"   ❌ Уровень 2: набрал {score} баллов ({breakdown_str}), "
             f"нужно {config['filters']['level_2_scoring']['min_pass_score']}"
         )
+        db.log_candidate(message.id, message.chat_id, channel_username, score, passed=False)
         return
 
     log.info(f"   ✅ Уровень 2 пройден! Score={score} ({breakdown_str})")
+    # Фиксируем как «найденную вакансию» до генерации письма — если бот упадёт
+    # посередине (например, на вызове Gemini), вакансия всё равно учтёна в /stats.
+    db.log_candidate(message.id, message.chat_id, channel_username, score, passed=True)
 
     author = extract_contact(vacancy_text)
 
@@ -390,6 +514,73 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def ping_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ping — быстрая проверка, что сервер жив и Bot API отвечает.
+    Не трогает Telethon/БД/Gemini — проверяет только сам факт, что процесс
+    жив и добрался до long polling."""
+    chat_id = update.effective_chat.id
+    if chat_id != ADMIN_CHAT_ID:
+        return
+    await update.effective_message.reply_text("pong 🏓")
+
+
+def build_stats_report():
+    """Собирает HTML-отчёт для /stats: воронка вакансий, конверсия, топ каналов
+    и ссылки на последние отклонённые на Уровне 2 вакансии."""
+    s = db.get_stats()
+
+    lines = ["📊 <b>Статистика бота</b>\n"]
+
+    lines.append("<b>Воронка фильтрации</b>")
+    lines.append(f"• Отсеяно на Уровне 1 (ключевые слова): <b>{s['level1_rejected']}</b>")
+    lines.append(f"• Дошло до Уровня 2 (оценено алгоритмом): <b>{s['total_candidates']}</b>")
+    lines.append(f"• Не прошли Уровень 2 (мало баллов): <b>{s['rejected_level2']}</b>")
+    lines.append(f"• Прошли Уровень 2 (найдены): <b>{s['passed_level2']}</b>")
+
+    if s["total_candidates"]:
+        conversion = round(100 * s["passed_level2"] / s["total_candidates"], 1)
+        lines.append(f"• Конверсия Уровень 1 → найдено: <b>{conversion}%</b>")
+
+    lines.append("\n<b>Что с найденными (прошли Уровень 2)</b>")
+    lines.append(f"• 🚀 Отправлено откликов: <b>{s['sent']}</b>")
+    lines.append(f"• ❌ Пропущено: <b>{s['skipped']}</b>")
+    lines.append(f"• ⏳ Ждёт решения: <b>{s['awaiting_decision']}</b>")
+
+    if s["avg_score"] is not None:
+        lines.append(f"\nСредний балл Level 2 у найденных: <b>{s['avg_score']}</b>")
+
+    if s["top_channels"]:
+        lines.append("\n<b>Топ каналов по найденным вакансиям</b>")
+        for uname, cnt in s["top_channels"]:
+            label = f"@{html.escape(uname)}" if uname != "?" else "неизвестно"
+            lines.append(f"• {label}: <b>{cnt}</b>")
+
+    if s["gemini_fallback"]:
+        lines.append(f"\n⚠️ Писем по шаблону из-за сбоев Gemini: <b>{s['gemini_fallback']}</b>")
+
+    if s["recent_rejected"]:
+        lines.append(f"\n<b>Последние отклонённые на Уровне 2</b> (последние {len(s['recent_rejected'])}):")
+        for row in s["recent_rejected"]:
+            link = message_link(row["chat_id"], row["message_id"])
+            label = f"@{html.escape(row['channel_username'])}" if row["channel_username"] else "канал неизвестен"
+            lines.append(f'• <a href="{link}">{label}, {row["score"]} баллов</a>')
+
+    return "\n".join(lines)
+
+
+async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/stats — воронка вакансий: сколько отсеялось на каждом этапе, сколько
+    отправлено/пропущено, и ссылки на последние отклонённые на Уровне 2 вакансии."""
+    chat_id = update.effective_chat.id
+    if chat_id != ADMIN_CHAT_ID:
+        return
+    await update.effective_message.reply_text(
+        build_stats_report(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
@@ -416,6 +607,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "skip":
         await query.answer()
         db.delete_pending(msg_id, chat_id)
+        db.set_vacancy_outcome(msg_id, chat_id, "skipped")
         await safe_edit(query, "❌ Отклик пропущен.")
         log.info(f"Отклик пропущен: msg_id={msg_id} chat_id={chat_id}")
         return
@@ -473,6 +665,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    db.set_vacancy_outcome(msg_id, chat_id, "sent")
     await safe_edit(query, f"✅ Отклик успешно отправлен @{html.escape(author)}.")
     log.info(f"Отклик отправлен: @{author}")
 
@@ -548,9 +741,8 @@ def build_ptb_application():
 
     if ptb_base_url:
         builder = builder.base_url(ptb_base_url)
-        request_kwargs = {"httpx_kwargs": {"headers": ptb_proxy_headers}}
-        builder = builder.request(HTTPXRequest(**request_kwargs))
-        builder = builder.get_updates_request(HTTPXRequest(**request_kwargs))
+        builder = builder.request(HTTPXRequest(httpx_kwargs={"headers": ptb_proxy_headers}))
+        builder = builder.get_updates_request(HTTPXRequest(httpx_kwargs={"headers": ptb_proxy_headers}))
 
     return builder.build()
 
@@ -563,11 +755,16 @@ async def main(mode="normal"):
 
     ptb_app = build_ptb_application()
     ptb_app.add_handler(CommandHandler("start", start_handler))
+    ptb_app.add_handler(CommandHandler("ping", ping_handler))
+    ptb_app.add_handler(CommandHandler("stats", stats_handler))
     ptb_app.add_handler(CallbackQueryHandler(button_handler))
     ptb_app.add_error_handler(error_handler)
 
     await ptb_app.initialize()
     bot: Bot = ptb_app.bot
+    # Даём notify_admin/TelegramAlertHandler доступ к уже запущенному боту, чтобы не
+    # создавать отдельный httpx-клиент на каждый алерт.
+    _admin_bot_ref["bot"] = bot
 
     # Стартовое уведомление — не «приятный бонус», а проверка живости канала
     # доставки. Если бот не может писать админу, вся фича мертва: вакансии будут
@@ -597,6 +794,9 @@ async def main(mode="normal"):
         drop_pending_updates=True,
         timeout=50
     )
+
+    # Нужно для ссылок на сообщения в /stats и отчётах о вакансиях.
+    await build_channel_username_map()
 
     # Обработчик регистрируем только после того, как канал доставки проверен.
     @client.on(events.NewMessage(chats=config["telegram"]["channels"]))
@@ -656,4 +856,19 @@ if __name__ == "__main__":
         client.loop.run_until_complete(main(mode=args.mode))
     except KeyboardInterrupt:
         log.info("Остановлено пользователем.")
+    except Exception:
+        # log.exception уже уйдёт через TelegramAlertHandler, НО только если в
+        # момент вызова ещё есть запущенный event loop — а к этому моменту
+        # run_until_complete уже завершился и логировать в нём больше некуда. Поэтому
+        # явно шлём алерт ещё раз через тот же (всё ещё живой) loop.
+        log.exception("Бот упал с необработанным исключением")
+        try:
+            crash_text = (
+                f"🔴 <b>Бот упал и остановился</b>\n"
+                f"<pre>{html.escape(traceback.format_exc()[-3500:])}</pre>"
+            )
+            client.loop.run_until_complete(notify_admin(crash_text))
+        except Exception:
+            pass
+        raise
         
