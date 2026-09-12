@@ -4,3 +4,7 @@ google-genai
 pyyaml
 websockets
 python-telegram-bot[ext]
+httpx
+
+# для тестов (tests/), не нужен в проде
+pytest

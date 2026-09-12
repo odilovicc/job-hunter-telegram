@@ -68,6 +68,51 @@ class Database:
                 value INTEGER NOT NULL DEFAULT 0
             )
         ''')
+
+        # --- Универсальные таблицы (Job/Application abstraction, см. models/) ---
+        # Добавляются РЯДОМ со старыми (processed_messages/pending_applications/
+        # vacancy_log) — старая история Telegram продолжает читаться старыми
+        # запросами без изменений. Новые таблицы просто дописываются вторым
+        # потоком с тех же самых точек кода (см. main.py) и используются для
+        # источник-агностичной статистики (/stats) и Indeed-пайплайна.
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dedup_key TEXT UNIQUE NOT NULL,
+                source TEXT NOT NULL,
+                external_id TEXT,
+                title TEXT,
+                company TEXT,
+                location TEXT,
+                url TEXT,
+                description TEXT,
+                score INTEGER,
+                status TEXT NOT NULL DEFAULT 'discovered',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL REFERENCES jobs(id),
+                status TEXT NOT NULL DEFAULT 'draft',
+                resume_name TEXT,
+                cover_letter TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                applied_at TIMESTAMP
+            )
+        ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS application_answers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                application_id INTEGER NOT NULL REFERENCES applications(id),
+                question TEXT,
+                answer TEXT,
+                confidence REAL,
+                source TEXT,
+                requires_confirmation INTEGER NOT NULL DEFAULT 1
+            )
+        ''')
         self.conn.commit()
         self._migrate_legacy_schema()
 
@@ -279,6 +324,127 @@ class Database:
             "recent_rejected": recent_rejected,
             "gemini_fallback": self.get_counter("gemini_fallback"),
         }
+
+    # --- Job / Application abstraction (общий пайплайн Telegram+Indeed, см. models/) ---
+
+    def upsert_job(self, dedup_key, source, external_id, title, company, location, url, description, score=None, status="discovered"):
+        """Создаёт запись о вакансии, если её ещё нет (по dedup_key — см.
+        services/deduplication.py). Возвращает (job_id, is_new). Если запись уже
+        есть — ничего не перезаписывает (кроме score, если передан), чтобы не затереть
+        уже принятое решение (skipped/applied) при повторной обработке той же вакансии.
+        """
+        with self.conn:
+            cur = self.conn.execute('SELECT id FROM jobs WHERE dedup_key = ?', (dedup_key,))
+            row = cur.fetchone()
+            if row:
+                job_id = row[0]
+                if score is not None:
+                    self.conn.execute('UPDATE jobs SET score = ? WHERE id = ?', (score, job_id))
+                return job_id, False
+
+            cur = self.conn.execute(
+                '''INSERT INTO jobs (dedup_key, source, external_id, title, company, location, url, description, score, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (dedup_key, source, external_id, title, company, location, url, description, score, status)
+            )
+            return cur.lastrowid, True
+
+    def set_job_status(self, job_id, status):
+        self.cursor.execute('UPDATE jobs SET status = ? WHERE id = ?', (status, job_id))
+        self.conn.commit()
+
+    def update_job_score_status(self, job_id, score, status):
+        self.cursor.execute('UPDATE jobs SET score = ?, status = ? WHERE id = ?', (score, status, job_id))
+        self.conn.commit()
+
+    def create_application(self, job_id, status, resume_name=None, cover_letter=None):
+        cur = self.conn.execute(
+            '''INSERT INTO applications (job_id, status, resume_name, cover_letter) VALUES (?, ?, ?, ?)''',
+            (job_id, status, resume_name, cover_letter)
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_application_status(self, application_id, status, mark_applied=False):
+        if mark_applied:
+            self.cursor.execute(
+                'UPDATE applications SET status = ?, applied_at = CURRENT_TIMESTAMP WHERE id = ?',
+                (status, application_id)
+            )
+        else:
+            self.cursor.execute('UPDATE applications SET status = ? WHERE id = ?', (status, application_id))
+        self.conn.commit()
+
+    def save_screener_answers(self, application_id, answers):
+        """answers: список словарей {question, answer, confidence, source, requires_confirmation}."""
+        with self.conn:
+            for a in answers:
+                self.conn.execute(
+                    '''INSERT INTO application_answers
+                       (application_id, question, answer, confidence, source, requires_confirmation)
+                       VALUES (?, ?, ?, ?, ?, ?)''',
+                    (application_id, a.get("question", ""), a.get("answer", ""),
+                     a.get("confidence", 0.0), a.get("source", ""),
+                     int(bool(a.get("requires_confirmation", True))))
+                )
+
+    def get_job_id_by_dedup_key(self, dedup_key):
+        cur = self.conn.execute('SELECT id FROM jobs WHERE dedup_key = ?', (dedup_key,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    def get_application(self, application_id):
+        cur = self.conn.execute(
+            'SELECT id, job_id, status, resume_name, cover_letter FROM applications WHERE id = ?',
+            (application_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        keys = ["id", "job_id", "status", "resume_name", "cover_letter"]
+        return dict(zip(keys, row))
+
+    def update_application_resume(self, application_id, resume_name):
+        self.cursor.execute('UPDATE applications SET resume_name = ? WHERE id = ?', (resume_name, application_id))
+        self.conn.commit()
+
+    def update_application_cover_letter(self, application_id, cover_letter):
+        self.cursor.execute('UPDATE applications SET cover_letter = ? WHERE id = ?', (cover_letter, application_id))
+        self.conn.commit()
+
+    def get_job_by_id(self, job_id):
+        cur = self.conn.execute(
+            'SELECT id, dedup_key, source, external_id, title, company, location, url, description, score, status '
+            'FROM jobs WHERE id = ?', (job_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        keys = ["id", "dedup_key", "source", "external_id", "title", "company", "location", "url", "description", "score", "status"]
+        return dict(zip(keys, row))
+
+    def get_source_stats(self):
+        """Статистика по /stats в разрезе источника (telegram/indeed), на основе таблиц
+        jobs/applications. Не заменяет старый get_stats() — тот продолжает читать vacancy_log."""
+        result = {}
+        for source in ("telegram", "indeed"):
+            found = self.conn.execute(
+                'SELECT COUNT(*) FROM jobs WHERE source = ?', (source,)
+            ).fetchone()[0]
+            qualified = self.conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE source = ? AND status NOT IN ('discovered', 'rejected')",
+                (source,)
+            ).fetchone()[0]
+            applied = self.conn.execute(
+                "SELECT COUNT(*) FROM applications a JOIN jobs j ON j.id = a.job_id "
+                "WHERE j.source = ? AND a.status = 'applied'",
+                (source,)
+            ).fetchone()[0]
+            skipped = self.conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE source = ? AND status = 'skipped'", (source,)
+            ).fetchone()[0]
+            result[source] = {"found": found, "qualified": qualified, "applied": applied, "skipped": skipped}
+        return result
 
 
 db = Database()

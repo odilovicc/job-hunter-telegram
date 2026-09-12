@@ -13,10 +13,6 @@ network:
 telegram:
   api_id:
   api_hash: ""
-
-admin_bot:
-  bot_token: ""   # токен от @BotFather
-  chat_id:        # числовой chat_id администратора (можно узнать через @userinfobot)
   channels:
     - "rabota_uz"
     - "ayti_jobs"
@@ -48,9 +44,71 @@ admin_bot:
     - "jobmarket_uz"
     - "frontendVacancy"
 
+admin_bot:
+  bot_token: ""   # токен от @BotFather
+  chat_id:        # числовой chat_id администратора (можно узнать через @userinfobot)
+
+# Источники вакансий. Можно включать/выключать независимо. Telegram — как и
+# раньше, событийный (слушает каналы через Telethon). Indeed — опрашивается
+# по расписанию (poll_interval_sec) через providers/indeed.py.
+sources:
+  telegram:
+    enabled: true
+  indeed:
+    enabled: false
+    # ВАЖНО: у Indeed нет официального API для поиска вакансий от лица соискателя
+    # (Job Sync API / Indeed Apply — только для работодателей/ATS). Поэтому этот
+    # источник реализован через Adzuna API (официальный, бесплатный в рамках
+    # лимитов агрегатор вакансий, НЕ является самим Indeed) — см. подробности в
+    # providers/indeed.py. Сам бот НЕ ходит на indeed.com и не эмулирует браузер.
+    #
+    # Adzuna покрывает ограниченный список стран (gb, us, de, fr, ca, au, in, pl, ...) —
+    # Узбекистан и Центральную Азию НЕ покрывает. Если ваша аудитория там — ищите
+    # удалённые/remote вакансии в поддерживаемой стране (например, country: "gb" +
+    # "remote" в search_queries), а не локальные вакансии.
+    adzuna:
+      app_id: ""   # из https://developer.adzuna.com/ (бесплатная регистрация)
+      app_key: ""
+      country: "gb"  # ISO-код страны из списка поддерживаемых Adzuna
+    search_queries:
+      - "Vue developer"
+      - "Frontend developer remote"
+    locations:
+      - ""  # пустая строка = поиск по всей стране; или укажите город/регион, напр. "London"
+    poll_interval_sec: 1800
+
 user_profile:
-  resume_path: "resume.pdf"
+  resume_path: "resume.pdf"  # используется, если ниже не задан блок resumes (обратная совместимость)
   position: "Middle Vue / Junior PHP Developer"
+
+# Несколько резюме под разные стеки — AI сам порекомендует подходящее
+# (см. recommended_resume в structured analysis, ai_generator.py). Если этот
+# блок не задан, используется единственное резюме из user_profile.resume_path.
+# resumes:
+#   default: "resume.pdf"
+#   frontend: "resumes/frontend.pdf"
+#   fullstack: "resumes/fullstack.pdf"
+#   laravel: "resumes/laravel.pdf"
+
+# Профиль кандидата — единственный источник правды о кандидате для AI.
+# Если поле не заполнено, AI обязан отвечать needs_user_input вместо того,
+# чтобы придумывать (особенно критично для salary_expectation/work_authorization).
+# Секретов сюда не кладите — только фактические данные о кандидате.
+candidate:
+  name: ""
+  email: ""
+  phone: ""
+  location: ""
+  skills: []
+  experience: []
+  education: []
+  languages: []
+  linkedin: ""
+  github: ""
+  portfolio: ""
+  salary_expectation: ""   # пусто = не настроено
+  work_authorization: ""   # пусто = не настроено (вопросы про visa/authorization всегда требуют подтверждения человеком)
+  relocation: ""
 
 filters:
   level_1_keywords:

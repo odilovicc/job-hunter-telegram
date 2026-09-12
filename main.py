@@ -21,6 +21,16 @@ from telegram.request import HTTPXRequest
 from database import db
 from filters import level_1_filter, level_2_scoring
 from ai_generator import generate_cover_letter, create_ai_client, FALLBACK_COVER_LETTER
+from models.job import Job
+from models.candidate import CandidateProfile
+from models.application import ApplicationDraft
+from providers.telegram import TelegramJobProvider
+from providers.indeed import IndeedJobProvider
+from applications.telegram import TelegramApplicationService
+from applications.indeed import IndeedApplicationService
+from services.job_pipeline import dedup_and_store, passes_level1, score_job
+from services.gemini_throttle import gemini_throttle
+from services.contact_extraction import extract_contact as _extract_contact_impl
 
 # Пути считаются от расположения скрипта, а не от текущей рабочей директории —
 # иначе запуск через systemd/cron с другим WorkingDirectory тихо создаёт
@@ -104,6 +114,36 @@ if RESUME_MISSING:
         f"пока файл не появится (см. user_profile.resume_path)."
     )
 
+# --- Несколько резюме (resumes:) — обратная совместимость с одиночным
+# user_profile.resume_path, если блок resumes не задан вовсе. ---
+_resumes_cfg = config.get("resumes")
+if _resumes_cfg:
+    RESUMES = {
+        name: (path if os.path.isabs(path) else os.path.join(BASE_DIR, path))
+        for name, path in _resumes_cfg.items()
+    }
+    RESUMES.setdefault("default", next(iter(RESUMES.values())))
+else:
+    RESUMES = {"default": RESUME_PATH}
+
+# --- Профиль кандидата для AI structured analysis (см. models/candidate.py) ---
+candidate_profile = CandidateProfile.from_config(config.get("candidate"))
+
+# --- Источники вакансий: telegram (событийный, как раньше) + indeed
+# (опциональный, опрашивается по расписанию). По умолчанию telegram включён,
+# indeed выключен — старое поведение бота не меняется, пока сам не включите. ---
+_sources_cfg = config.get("sources") or {}
+_telegram_source_cfg = _sources_cfg.get("telegram") or {}
+_indeed_source_cfg = _sources_cfg.get("indeed") or {}
+TELEGRAM_SOURCE_ENABLED = _telegram_source_cfg.get("enabled", True)
+INDEED_SOURCE_ENABLED = _indeed_source_cfg.get("enabled", False)
+INDEED_POLL_INTERVAL_SEC = int(_indeed_source_cfg.get("poll_interval_sec", 1800))
+
+# Общий rate-limiter Gemini (см. services/gemini_throttle.py) — используется и
+# для писем Telegram (generate_letter), и для structured analysis (Indeed).
+gemini_throttle.min_interval_sec = GEMINI_MIN_INTERVAL_SEC
+gemini_throttle.timeout_sec = GEMINI_TIMEOUT_SEC
+
 # --- Режим сети: "direct" (как раньше) или "cloudflare_worker" ---
 # Нужен, когда хостинг бота не имеет нормального прямого доступа к Telegram
 # и/или Google (например, сервер в РФ). В режиме cloudflare_worker и MTProto
@@ -169,6 +209,31 @@ channel_usernames = {ch.lstrip("@").lower() for ch in config["telegram"]["channe
 # Заполняется один раз при старте (см. build_channel_username_map) — не резолвим
 # на каждое сообщение, чтобы не дёргать Telethon лишний раз.
 channel_username_by_chat_id = {}
+
+# --- Job providers / application services (см. providers/, applications/) ---
+# TelegramJobProvider.to_job() использует тот же channel_username_by_chat_id,
+# который заполняется позже в build_channel_username_map — это тот же словарь по
+# ссылке (мутируется на месте), не копия.
+telegram_provider = TelegramJobProvider(client, config["telegram"]["channels"], channel_username_by_chat_id)
+telegram_app_service = TelegramApplicationService(client, channel_usernames, RESUMES, config, ai_client)
+
+indeed_provider = None
+indeed_app_service = None
+if INDEED_SOURCE_ENABLED:
+    _adzuna_cfg = _indeed_source_cfg.get("adzuna") or {}
+    indeed_provider = IndeedJobProvider(
+        search_queries=_indeed_source_cfg.get("search_queries") or [],
+        locations=_indeed_source_cfg.get("locations") or [],
+        app_id=_adzuna_cfg.get("app_id", ""),
+        app_key=_adzuna_cfg.get("app_key", ""),
+        country=_adzuna_cfg.get("country", ""),
+    )
+    indeed_app_service = IndeedApplicationService(config, ai_client, RESUMES)
+    log.info(
+        f"Источник Indeed включён, опрос каждые {INDEED_POLL_INTERVAL_SEC}с "
+        f"через Adzuna API (country={indeed_provider.country!r}). Это НЕ сам Indeed — "
+        f"у Indeed нет официального API для этого, см. providers/indeed.py."
+    )
 
 
 def message_link(chat_id, msg_id):
@@ -277,30 +342,14 @@ class TelegramAlertHandler(logging.Handler):
 
 log.addHandler(TelegramAlertHandler())
 
-# Сериализация обращений к Gemini (см. GEMINI_MIN_INTERVAL_SEC).
-# Lock создаётся лениво, а не на уровне модуля: до Python 3.10
-# asyncio.Lock() привязывается к текущему event loop в момент создания, а на
-# импорте модуля нужного loop'а ещё может не быть — тогда первый же await падает
-# с "attached to a different loop".
-_gemini_lock = None
-_gemini_last_call = 0.0
-
-
-def _get_gemini_lock():
-    global _gemini_lock
-    if _gemini_lock is None:
-        _gemini_lock = asyncio.Lock()
-    return _gemini_lock
-
-
 def extract_contact(text):
-    """Ищет юзернейм HR в тексте вакансии. Возвращает None, если не нашёл."""
-    usernames = re.findall(r'@([A-Za-z0-9_]{5,32})', text)
-    for username in usernames:
-        # Пропускаем юзернеймы каналов, чтобы не писать самому каналу
-        if username.lower() not in channel_usernames:
-            return username
-    return None
+    """Ищет юзернейм HR в тексте вакансии. Возвращает None, если не нашёл.
+
+    Перенесено в services/contact_extraction.py, чтобы applications/telegram.py могло
+    переиспользовать ту же логику без циклического импорта; эта функция оставлена
+    как тонкая обёртка, чтобы не менять вызовы по всему main.py.
+    """
+    return _extract_contact_impl(text, channel_usernames)
 
 
 async def generate_letter(vacancy_text):
@@ -308,24 +357,15 @@ async def generate_letter(vacancy_text):
 
     generate_cover_letter делает синхронный сетевой запрос к Gemini — если вызвать
     его напрямую, он блокирует весь event loop (все каналы, все кнопки) на время
-    запроса. Уносим в отдельный поток и ограничиваем таймаутом.
+    запроса. Уносим в отдельный поток и ограничиваем таймаутом через общий
+    gemini_throttle (см. services/gemini_throttle.py) — общий с Indeed structured
+    analysis, чтобы оба источника не удваивали реальный RPS к Gemini.
     """
-    global _gemini_last_call
-
-    async with _get_gemini_lock():
-        wait = GEMINI_MIN_INTERVAL_SEC - (time.monotonic() - _gemini_last_call)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        try:
-            letter = await asyncio.wait_for(
-                asyncio.to_thread(generate_cover_letter, vacancy_text, config, ai_client),
-                timeout=GEMINI_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError:
-            log.error("Таймаут Gemini API при генерации письма")
-            letter = FALLBACK_COVER_LETTER
-        finally:
-            _gemini_last_call = time.monotonic()
+    try:
+        letter = await gemini_throttle.run(generate_cover_letter, vacancy_text, config, ai_client)
+    except asyncio.TimeoutError:
+        log.error("Таймаут Gemini API при генерации письма")
+        letter = FALLBACK_COVER_LETTER
 
     # generate_cover_letter сам глотает ошибки и возвращает заглушку, поэтому
     # распознаём фолбэк по содержимому — админу важно знать, что письмо шаблонное.
@@ -456,18 +496,25 @@ async def handle_message(message, bot: Bot):
     breakdown_str = ", ".join(breakdown) if breakdown else "нет совпадений"
     channel_username = channel_username_by_chat_id.get(message.chat_id)
 
+    # Общая таблица jobs (см. models/job.py, services/job_pipeline.py) — дописывается рядом
+    # с vacancy_log в тех же точках, ничего в старом поведении не меняет — нужна только для
+    # единой статистики по /stats в разрезе источника.
+    job = telegram_provider.to_job(message)
+
     if not is_passed:
         log.info(
             f"   ❌ Уровень 2: набрал {score} баллов ({breakdown_str}), "
             f"нужно {config['filters']['level_2_scoring']['min_pass_score']}"
         )
         db.log_candidate(message.id, message.chat_id, channel_username, score, passed=False)
+        dedup_and_store(db, job, score=score, status="rejected")
         return
 
     log.info(f"   ✅ Уровень 2 пройден! Score={score} ({breakdown_str})")
     # Фиксируем как «найденную вакансию» до генерации письма — если бот упадёт
     # посередине (например, на вызове Gemini), вакансия всё равно учтёна в /stats.
     db.log_candidate(message.id, message.chat_id, channel_username, score, passed=True)
+    dedup_and_store(db, job, score=score, status="qualified")
 
     author = extract_contact(vacancy_text)
 
@@ -565,6 +612,24 @@ def build_stats_report():
             label = f"@{html.escape(row['channel_username'])}" if row["channel_username"] else "канал неизвестен"
             lines.append(f'• <a href="{link}">{label}, {row["score"]} баллов</a>')
 
+    # --- Статистика по источникам (jobs/applications, см. database.py::get_source_stats).
+    # Считана с момента внедрения Job-абстракции, не заменяет воронку выше. ---
+    src_stats = db.get_source_stats()
+    lines.append("\n\n<b>📊 По источникам</b>")
+    for source, label in (("telegram", "📨 Telegram"), ("indeed", "🌐 Indeed")):
+        st = src_stats[source]
+        lines.append(f"\n{label}")
+        lines.append(f"Found: <b>{st['found']}</b>")
+        lines.append(f"Qualified: <b>{st['qualified']}</b>")
+        lines.append(f"Applied: <b>{st['applied']}</b>")
+        lines.append(f"Skipped: <b>{st['skipped']}</b>")
+        if st["qualified"]:
+            conv = round(100 * st["applied"] / st["qualified"], 1)
+            lines.append(f"Application conversion: <b>{conv}%</b>")
+
+    if not INDEED_SOURCE_ENABLED:
+        lines.append("\n<i>(Indeed выключён — sources.indeed.enabled: false)</i>")
+
     return "\n".join(lines)
 
 
@@ -608,6 +673,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         db.delete_pending(msg_id, chat_id)
         db.set_vacancy_outcome(msg_id, chat_id, "skipped")
+        _job_id = db.get_job_id_by_dedup_key(f"telegram:{chat_id}:{msg_id}")
+        if _job_id:
+            db.set_job_status(_job_id, "skipped")
         await safe_edit(query, "❌ Отклик пропущен.")
         log.info(f"Отклик пропущен: msg_id={msg_id} chat_id={chat_id}")
         return
@@ -646,26 +714,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # пока идёт отправка (она занимает несколько секунд).
     await safe_edit(query, f"⏳ Отправляю отклик @{html.escape(author)}…")
 
-    try:
-        async with client.action(author, 'typing'):
-            await asyncio.sleep(2)
-
-        await client.send_file(author, file=RESUME_PATH, caption=cover_letter)
-    except Exception as e:
-        log.error(f"Ошибка отправки @{author}: {e}")
+    # Фактическая отправка через TelegramApplicationService.submit() (applications/telegram.py) —
+    # то же самое client.action+send_file, теперь за ApplicationService абстракцией.
+    # Вся остальная оркестрация (claim_pending/retry/safe_edit) не тронута.
+    draft = ApplicationDraft(
+        job=Job(source="telegram", external_id=f"{chat_id}:{msg_id}"),
+        candidate=candidate_profile,
+        cover_letter=cover_letter,
+        resume_path=RESUME_PATH,
+        contact=author,
+    )
+    result = await telegram_app_service.submit(draft)
+    if not result.success:
+        log.error(f"Ошибка отправки @{author}: {result.message}")
         # Возвращаем заявку в БД и кнопки в сообщение: отправка не удалась, но
         # письмо уже сгенерировано — админ может повторить попытку, а не терять
         # вакансию из-за разовой сетевой ошибки.
         db.save_pending(msg_id, chat_id, author, cover_letter)
         await safe_edit(
             query,
-            f"❌ Не удалось отправить @{html.escape(author)}:\n<code>{html.escape(str(e))}</code>\n\n"
+            f"❌ Не удалось отправить @{html.escape(author)}:\n<code>{html.escape(result.message)}</code>\n\n"
             f"Можно повторить попытку.",
             reply_markup=build_keyboard(chat_id, msg_id, has_contact=True),
         )
         return
 
     db.set_vacancy_outcome(msg_id, chat_id, "sent")
+    _job_id = db.get_job_id_by_dedup_key(f"telegram:{chat_id}:{msg_id}")
+    if _job_id:
+        db.set_job_status(_job_id, "applied")
+        _app_id = db.create_application(_job_id, status="applied", resume_name="default", cover_letter=cover_letter)
+        db.update_application_status(_app_id, "applied", mark_applied=True)
     await safe_edit(query, f"✅ Отклик успешно отправлен @{html.escape(author)}.")
     log.info(f"Отклик отправлен: @{author}")
 
@@ -689,6 +768,203 @@ async def error_handler(update, context):
     """Без этого исключение в обработчике PTB уходит в его внутренний логгер, и
     в bot.log не остаётся ни стектрейса, ни контекста."""
     log.error("Необработанная ошибка в обработчике Bot API", exc_info=context.error)
+
+
+# --- Indeed: отдельный UI/pipeline (см. providers/indeed.py, applications/indeed.py) ---
+# Напоминание: submit() для Indeed НИКОГДА не подаёт заявку автоматически —
+# официального API для этого нет. Админ открывает ссылку и подтверждает подачу вручную.
+
+def build_indeed_report(draft: ApplicationDraft) -> str:
+    """HTML-отчёт по вакансии Indeed для админа — формат согласован отдельно от
+    Telegram-отчёта (build_report), чтобы не трогать его."""
+    job = draft.job
+    lines = [f"🔥 <b>{html.escape(job.title or '(без названия)')}</b>\n"]
+    if job.company:
+        lines.append(f"🏢 {html.escape(job.company)}")
+    if job.location:
+        lines.append(f"📍 {html.escape(job.location)}")
+    if job.salary:
+        lines.append(f"💰 {html.escape(job.salary)}")
+
+    lines.append(f"\n🎯 Match: <b>{draft.match_score}%</b> ({html.escape(draft.recommendation)})")
+
+    if draft.strengths:
+        lines.append("\n✅ " + "; ".join(html.escape(s) for s in draft.strengths))
+    if draft.missing_requirements:
+        lines.append("\n⚠️ " + "; ".join(html.escape(s) for s in draft.missing_requirements))
+    if draft.risks:
+        lines.append("\n🚩 " + "; ".join(html.escape(s) for s in draft.risks))
+
+    letter_esc, letter_cut = escape_fit(draft.cover_letter, 1200)
+    lines.append(f"\n🤖 <b>Cover letter:</b>\n{letter_esc}{'…' if letter_cut else ''}")
+    if draft.is_ai_fallback:
+        lines.append("⚠️ <i>Gemini недоступен, письмо/анализ шаблонные.</i>")
+
+    if draft.screener_questions:
+        lines.append("\n❓ <b>Возможные вопросы анкеты:</b>")
+        for q in draft.screener_questions[:8]:
+            mark = "⚠️ требует подтверждения" if q.requires_confirmation else f"conf={q.confidence:.1f}"
+            answer = html.escape(q.answer) if q.answer else "—"
+            lines.append(f"• {html.escape(q.question)}\n  → {answer} ({mark})")
+
+    resume_file = os.path.basename(draft.resume_path or draft.resume_name)
+    lines.append(f"\n📄 Resume: <code>{html.escape(resume_file)}</code>")
+
+    return "\n".join(lines)[:TELEGRAM_MSG_LIMIT]
+
+
+def build_indeed_keyboard(job_id, application_id, job_url):
+    suffix = f"{job_id}_{application_id}"
+    rows = []
+    if job_url:
+        rows.append([InlineKeyboardButton("🚀 Apply on Indeed", url=job_url)])
+    rows.append([
+        InlineKeyboardButton("✅ Я откликнулся", callback_data=f"indeed_applied_{suffix}"),
+        InlineKeyboardButton("❌ Skip", callback_data=f"indeed_skip_{suffix}"),
+    ])
+    rows.append([
+        InlineKeyboardButton("📝 Переписать письмо", callback_data=f"indeed_editletter_{suffix}"),
+        InlineKeyboardButton("📄 Сменить резюме", callback_data=f"indeed_resume_{suffix}"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def process_indeed_job(job: Job, bot: Bot):
+    """Один элемент опроса Indeed: dedup -> level1/level2 -> AI structured analysis ->
+    отчёт админу. Никогда не подаёт заявку самостоятельно."""
+    job_id, is_new = dedup_and_store(db, job, status="discovered")
+    if not is_new:
+        log.debug(f"Indeed: вакансия {job.id} уже видели раньше, пропускаю")
+        return
+
+    if not passes_level1(job, config):
+        db.set_job_status(job_id, "rejected")
+        return
+
+    score, is_passed, breakdown = score_job(job, config)
+    if not is_passed:
+        db.update_job_score_status(job_id, score, "rejected")
+        return
+
+    db.update_job_score_status(job_id, score, "qualified")
+
+    try:
+        draft = await indeed_app_service.prepare(job, candidate_profile)
+    except Exception:
+        log.exception(f"Сбой подготовки Indeed-заявки для job_id={job_id}")
+        return
+
+    application_id = db.create_application(
+        job_id, status="ready", resume_name=draft.resume_name, cover_letter=draft.cover_letter
+    )
+    db.save_screener_answers(application_id, [
+        {"question": q.question, "answer": q.answer, "confidence": q.confidence,
+         "source": q.source, "requires_confirmation": q.requires_confirmation}
+        for q in draft.screener_questions
+    ])
+
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=build_indeed_report(draft),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_indeed_keyboard(job_id, application_id, job.url),
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.error(f"Не удалось отправить Indeed-отчёт админу (job_id={job_id}): {e}")
+
+
+def _current_message_text(query) -> str:
+    """query.message может быть None/InaccessibleMessage (сообщению >48ч или удалено) —
+    тогда у него нет .text_html/.text. Возвращаем пустую строку вместо падения."""
+    message = getattr(query, "message", None)
+    if message is None:
+        return ""
+    return getattr(message, "text_html", None) or getattr(message, "text", None) or ""
+
+
+async def indeed_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_CHAT_ID:
+        log.warning(f"Отклонено нажатие (Indeed) от чужого пользователя id={query.from_user.id}")
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = (query.data or "").split("_")
+    if len(parts) != 4:
+        await query.answer()
+        return
+    _, action, job_id_raw, app_id_raw = parts
+    try:
+        job_id = int(job_id_raw)
+        application_id = int(app_id_raw)
+    except ValueError:
+        await query.answer()
+        return
+
+    if action == "skip":
+        await query.answer()
+        db.set_job_status(job_id, "skipped")
+        db.update_application_status(application_id, "skipped")
+        await safe_edit(query, "❌ Вакансия Indeed пропущена.")
+        return
+
+    if action == "applied":
+        await query.answer("Отмечено ✅")
+        result = IndeedApplicationService.confirm_applied()
+        db.set_job_status(job_id, "applied")
+        db.update_application_status(application_id, "applied", mark_applied=True)
+        current_text = _current_message_text(query)
+        await safe_edit(query, f"{current_text}\n\n✅ <b>{html.escape(result.message)}</b>")
+        return
+
+    if action == "editletter":
+        await query.answer("Переписываю письмо…")
+        job_row = db.get_job_by_id(job_id)
+        if not job_row:
+            return
+        job = Job(
+            source=job_row["source"], external_id=job_row["external_id"], title=job_row["title"],
+            company=job_row["company"], location=job_row["location"], url=job_row["url"],
+            description=job_row["description"],
+        )
+        try:
+            draft = await indeed_app_service.prepare(job, candidate_profile)
+        except Exception:
+            log.exception(f"Не удалось перегенерировать письмо Indeed для job_id={job_id}")
+            return
+        db.update_application_cover_letter(application_id, draft.cover_letter)
+        await safe_edit(
+            query, build_indeed_report(draft),
+            reply_markup=build_indeed_keyboard(job_id, application_id, job.url),
+        )
+        return
+
+    if action == "resume":
+        await query.answer()
+        app_row = db.get_application(application_id)
+        if not app_row or not RESUMES:
+            return
+        names = list(RESUMES.keys())
+        try:
+            idx = names.index(app_row["resume_name"])
+        except ValueError:
+            idx = -1
+        next_name = names[(idx + 1) % len(names)]
+        db.update_application_resume(application_id, next_name)
+        resume_file = os.path.basename(RESUMES[next_name])
+        current_text = _current_message_text(query)
+        new_text = re.sub(
+            r"📄 Resume: <code>.*?</code>",
+            f"📄 Resume: <code>{html.escape(resume_file)}</code>",
+            current_text,
+        )
+        reply_markup = getattr(query.message, "reply_markup", None) if query.message else None
+        await safe_edit(query, new_text, reply_markup=reply_markup)
+        return
+
+    await query.answer()
 
 
 async def authorize_telethon():
@@ -757,7 +1033,8 @@ async def main(mode="normal"):
     ptb_app.add_handler(CommandHandler("start", start_handler))
     ptb_app.add_handler(CommandHandler("ping", ping_handler))
     ptb_app.add_handler(CommandHandler("stats", stats_handler))
-    ptb_app.add_handler(CallbackQueryHandler(button_handler))
+    ptb_app.add_handler(CallbackQueryHandler(button_handler, pattern=r"^(send|skip)_"))
+    ptb_app.add_handler(CallbackQueryHandler(indeed_button_handler, pattern=r"^indeed_"))
     ptb_app.add_error_handler(error_handler)
 
     await ptb_app.initialize()
@@ -799,17 +1076,42 @@ async def main(mode="normal"):
     await build_channel_username_map()
 
     # Обработчик регистрируем только после того, как канал доставки проверен.
-    @client.on(events.NewMessage(chats=config["telegram"]["channels"]))
-    async def process_new_vacancy(event):
-        try:
-            await handle_message(event.message, bot)
-        except Exception:
-            # Исключение в обработчике Telethon гасится библиотекой почти
-            # бесследно — логируем со стектрейсом сами.
-            log.exception(f"Ошибка обработки сообщения id={event.message.id}")
+    # sources.telegram.enabled позволяет полностью выключить Telegram как источник
+    # вакансий (по умолчанию включён — поведение не меняется).
+    if TELEGRAM_SOURCE_ENABLED:
+        @client.on(events.NewMessage(chats=config["telegram"]["channels"]))
+        async def process_new_vacancy(event):
+            try:
+                await handle_message(event.message, bot)
+            except Exception:
+                # Исключение в обработчике Telethon гасится библиотекой почти
+                # бесследно — логируем со стектрейсом сами.
+                log.exception(f"Ошибка обработки сообщения id={event.message.id}")
+    else:
+        log.info("Источник Telegram выключён (sources.telegram.enabled: false) — каналы не опрашиваются.")
+
+    # Indeed-пайплайн: opt-in, опрашивает фид с интервалом INDEED_POLL_INTERVAL_SEC.
+    # Не блокирует старт бота, если фид не настроен (см. providers/indeed.py).
+    indeed_poll_task = None
+    if INDEED_SOURCE_ENABLED:
+        async def indeed_poll_loop():
+            while True:
+                try:
+                    jobs = await indeed_provider.fetch_jobs()
+                    log.debug(f"Indeed: получено {len(jobs)} вакансий из фида")
+                    for job in jobs:
+                        try:
+                            await process_indeed_job(job, bot)
+                        except Exception:
+                            log.exception(f"Ошибка обработки Indeed-вакансии {job.id}")
+                except Exception:
+                    log.exception("Ошибка опроса Indeed")
+                await asyncio.sleep(INDEED_POLL_INTERVAL_SEC)
+
+        indeed_poll_task = asyncio.create_task(indeed_poll_loop())
 
     try:
-        if mode == "yest":
+        if mode == "yest" and TELEGRAM_SOURCE_ENABLED:
             log.info("Режим --mode=yest: Собираем вакансии за вчера и сегодня...")
 
             yesterday = datetime.now(timezone.utc) - timedelta(days=1)
@@ -835,6 +1137,8 @@ async def main(mode="normal"):
         await client.run_until_disconnected()
     finally:
         log.info("Останавливаю Admin Bot...")
+        if indeed_poll_task is not None:
+            indeed_poll_task.cancel()
         if ptb_app.updater.running:
             await ptb_app.updater.stop()
         if ptb_app.running:
