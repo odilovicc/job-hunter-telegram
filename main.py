@@ -20,7 +20,11 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from telegram.request import HTTPXRequest
 from database import db
 from filters import level_1_filter, level_2_scoring
-from ai_generator import generate_cover_letter, create_ai_client, FALLBACK_COVER_LETTER
+from ai_generator import create_ai_client, FALLBACK_COVER_LETTER
+from ai_gateway import AIGateway
+from hh_letters import LetterService
+from hh_handlers import HHHandlers, MENU
+from history_scan import HistoryScanner, MessageGate
 
 # Пути считаются от расположения скрипта, а не от текущей рабочей директории —
 # иначе запуск через systemd/cron с другим WorkingDirectory тихо создаёт
@@ -30,13 +34,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Telegram режет сообщения на 4096 символах. Если отчёт окажется длиннее,
 # send_message упадёт и вакансия не дойдёт до админа — поэтому длину бюджетируем.
 TELEGRAM_MSG_LIMIT = 4096
-
-# Минимальный интервал между запросами к Gemini. Раньше это был просто
-# `await asyncio.sleep(1)` внутри обработчика, но Telethon запускает обработчики
-# NewMessage параллельно, поэтому при пачке сообщений из разных каналов все они
-# засыпали одновременно и уходили в API одновременно — никакого rate limit не было.
-GEMINI_MIN_INTERVAL_SEC = 1.0
-GEMINI_TIMEOUT_SEC = 30
 
 # --- Нормальное логирование вместо print() ---
 # RotatingFileHandler — при работе на сервере месяцами bot.log не должен расти бесконечно.
@@ -277,20 +274,14 @@ class TelegramAlertHandler(logging.Handler):
 
 log.addHandler(TelegramAlertHandler())
 
-# Сериализация обращений к Gemini (см. GEMINI_MIN_INTERVAL_SEC).
-# Lock создаётся лениво, а не на уровне модуля: до Python 3.10
-# asyncio.Lock() привязывается к текущему event loop в момент создания, а на
-# импорте модуля нужного loop'а ещё может не быть — тогда первый же await падает
-# с "attached to a different loop".
-_gemini_lock = None
-_gemini_last_call = 0.0
+_ai_gateway = None
 
 
-def _get_gemini_lock():
-    global _gemini_lock
-    if _gemini_lock is None:
-        _gemini_lock = asyncio.Lock()
-    return _gemini_lock
+def get_ai_gateway():
+    global _ai_gateway
+    if _ai_gateway is None:
+        _ai_gateway = AIGateway(ai_client, config["ai"], db.increment_counter)
+    return _ai_gateway
 
 
 def extract_contact(text):
@@ -304,31 +295,15 @@ def extract_contact(text):
 
 
 async def generate_letter(vacancy_text):
-    """Генерирует письмо. Возвращает (letter, is_fallback).
+    """Мониторинг использует ту же очередь Gemini, что и ручные письма."""
+    try:
+        prompt = config["ai"]["prompt_template"].format(vacancy_text=vacancy_text)
+        letter = await get_ai_gateway().generate(prompt)
+    except Exception as exc:
+        log.warning("Ошибка Gemini при мониторинге (%s)", type(exc).__name__)
+        letter = FALLBACK_COVER_LETTER
 
-    generate_cover_letter делает синхронный сетевой запрос к Gemini — если вызвать
-    его напрямую, он блокирует весь event loop (все каналы, все кнопки) на время
-    запроса. Уносим в отдельный поток и ограничиваем таймаутом.
-    """
-    global _gemini_last_call
-
-    async with _get_gemini_lock():
-        wait = GEMINI_MIN_INTERVAL_SEC - (time.monotonic() - _gemini_last_call)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        try:
-            letter = await asyncio.wait_for(
-                asyncio.to_thread(generate_cover_letter, vacancy_text, config, ai_client),
-                timeout=GEMINI_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError:
-            log.error("Таймаут Gemini API при генерации письма")
-            letter = FALLBACK_COVER_LETTER
-        finally:
-            _gemini_last_call = time.monotonic()
-
-    # generate_cover_letter сам глотает ошибки и возвращает заглушку, поэтому
-    # распознаём фолбэк по содержимому — админу важно знать, что письмо шаблонное.
+    # Существующий мониторинг сохраняет явную отметку шаблонного письма.
     is_fallback = not letter or not letter.strip() or letter.strip() == FALLBACK_COVER_LETTER.strip()
     if is_fallback:
         db.increment_counter("gemini_fallback")
@@ -427,27 +402,35 @@ async def send_vacancy_to_admin(bot: Bot, message, score, breakdown, cover_lette
     )
 
 
+_message_gate = MessageGate()
+
+
 async def handle_message(message, bot: Bot):
+    return await _message_gate.run(
+        (message.chat_id, message.id), lambda: _handle_message(message, bot))
+
+
+async def _handle_message(message, bot: Bot):
     """Основная логика обработки одного сообщения."""
     vacancy_text = message.text or ""
 
     if not vacancy_text:
-        return
+        return "empty"
 
     preview = vacancy_text[:80].replace('\n', ' ')
     log.debug(f"📨 Читаю сообщение id={message.id} chat={message.chat_id}: \"{preview}...\"")
 
     if db.is_processed(message.id, message.chat_id):
         log.debug("   ⏭ Пропуск: уже обработано ранее")
-        return
+        return "duplicate"
 
     # Уровень 1: Быстрый фильтр
     if not level_1_filter(vacancy_text, config):
         log.debug("   ❌ Уровень 1: не прошёл фильтр ключевых слов")
-        # Без ссылок на конкретные сообщения — объём слишком большой (почти всё,
-        # что пишут каналы), для /stats достаточно одного счётчика.
+        # Текст отказа не сохраняем, только ID для дедупликации и счётчик /stats.
         db.increment_counter("level1_rejected")
-        return
+        db.mark_processed(message.id, message.chat_id)
+        return "rejected"
 
     log.info(f"   ✅ Уровень 1 пройден! id={message.id}")
 
@@ -462,7 +445,8 @@ async def handle_message(message, bot: Bot):
             f"нужно {config['filters']['level_2_scoring']['min_pass_score']}"
         )
         db.log_candidate(message.id, message.chat_id, channel_username, score, passed=False)
-        return
+        db.mark_processed(message.id, message.chat_id)
+        return "rejected"
 
     log.info(f"   ✅ Уровень 2 пройден! Score={score} ({breakdown_str})")
     # Фиксируем как «найденную вакансию» до генерации письма — если бот упадёт
@@ -488,13 +472,14 @@ async def handle_message(message, bot: Bot):
         # и уже никогда не всплывёт — молча терялась.
         db.delete_pending(message.id, message.chat_id)
         log.error(f"Не удалось отправить отчёт админу для message_id={message.id}: {e}")
-        return
+        return "failed"
 
     db.mark_processed(message.id, message.chat_id)
     log.info(
         f"Вакансия найдена! Score={score} ({breakdown_str}), "
         f"HR={'@' + author if author else 'контакт не найден'}"
     )
+    return "delivered"
 
 
 # --- Обработчики Bot API ---
@@ -510,7 +495,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.effective_message.reply_text(
         "✅ Бот на связи. Здесь будут появляться подходящие вакансии с кнопками "
-        "«Отправить отклик» / «Пропустить»."
+        "«Отправить отклик» / «Пропустить».\n"
+        "Для пропущенных вакансий — «🔎 Скан истории» или /scan.\n"
+        "Для письма по ссылке HH нажмите кнопку ниже. /resume — профиль, /letters — повтор ошибок.",
+        reply_markup=MENU
     )
 
 
@@ -531,6 +519,10 @@ def build_stats_report():
 
     lines = ["📊 <b>Статистика бота</b>\n"]
 
+    lines.append(f"Gemini: запросов {db.get_counter('ai_requests')}, "
+                 f"входных токенов {db.get_counter('ai_prompt_token_count')}, "
+                 f"выходных {db.get_counter('ai_candidates_token_count')}, "
+                 f"thinking {db.get_counter('ai_thoughts_token_count')}\n")
     lines.append("<b>Воронка фильтрации</b>")
     lines.append(f"• Отсеяно на Уровне 1 (ключевые слова): <b>{s['level1_rejected']}</b>")
     lines.append(f"• Дошло до Уровня 2 (оценено алгоритмом): <b>{s['total_candidates']}</b>")
@@ -757,6 +749,10 @@ async def main(mode="normal"):
     ptb_app.add_handler(CommandHandler("start", start_handler))
     ptb_app.add_handler(CommandHandler("ping", ping_handler))
     ptb_app.add_handler(CommandHandler("stats", stats_handler))
+    scanner = HistoryScanner(client, config["telegram"]["channels"], handle_message, ADMIN_CHAT_ID)
+    scanner.register(ptb_app)
+    hh_service = LetterService(db.conn, RESUME_PATH, get_ai_gateway(), config.get("cover_letters", {}))
+    HHHandlers(hh_service, ADMIN_CHAT_ID).register(ptb_app)
     ptb_app.add_handler(CallbackQueryHandler(button_handler))
     ptb_app.add_error_handler(error_handler)
 
@@ -777,7 +773,7 @@ async def main(mode="normal"):
         )
 
     try:
-        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=startup_text, parse_mode=ParseMode.HTML)
+        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=startup_text + "\nПисьма HH: /letter · Профиль: /resume · Повтор ошибок: /letters", parse_mode=ParseMode.HTML, reply_markup=MENU)
     except Forbidden:
         await ptb_app.shutdown()
         raise SystemExit(
@@ -815,21 +811,16 @@ async def main(mode="normal"):
             yesterday = datetime.now(timezone.utc) - timedelta(days=1)
             yesterday_start = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
 
-            for channel in config["telegram"]["channels"]:
-                log.info(f"📡 Парсинг истории канала: {channel}")
-                try:
-                    async for msg in client.iter_messages(channel, offset_date=yesterday_start, reverse=True):
-                        try:
-                            await handle_message(msg, bot)
-                        except Exception:
-                            # Одна битая вакансия не должна обрывать разбор
-                            # всего канала (а раньше — и всех следующих каналов).
-                            log.exception(f"Ошибка обработки истории id={msg.id}")
-                        await asyncio.sleep(0.5)
-                except Exception as e:
-                    log.warning(f"Ошибка доступа к каналу {channel}: {e}")
+            from types import SimpleNamespace
+            class AdminScanMessage:
+                def get_bot(self):
+                    return bot
 
-            log.info("Исторические вакансии обработаны!")
+                async def reply_text(self, text):
+                    return await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+
+            await scanner.start(AdminScanMessage(), SimpleNamespace(application=ptb_app),
+                                days=2, since=yesterday_start)
 
         log.info("Бот запущен. Мониторим новые вакансии в реальном времени...")
         await client.run_until_disconnected()
@@ -837,6 +828,7 @@ async def main(mode="normal"):
         log.info("Останавливаю Admin Bot...")
         if ptb_app.updater.running:
             await ptb_app.updater.stop()
+        await scanner.shutdown()
         if ptb_app.running:
             await ptb_app.stop()
         await ptb_app.shutdown()

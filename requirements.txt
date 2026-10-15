@@ -4,3 +4,6 @@ google-genai
 pyyaml
 websockets
 python-telegram-bot[ext]
+
+httpx>=0.27,<1
+pypdf>=5,<7

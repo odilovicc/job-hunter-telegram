@@ -157,6 +157,9 @@ filters:
 
 ai:
   gemini_api_key: ""
+  model: "gemini-3.6-flash"
+  min_interval_sec: 2
+  timeout_sec: 45
   prompt_template: |
     Ты — профессиональный программист. Твоя специализация: Vue Frontend (Middle) и PHP/Laravel (Junior).
     Вот текст вакансии:
@@ -167,3 +170,12 @@ ai:
     - Обязательно упомяни, что мое резюме прикреплено к сообщению.
     - Пиши уверенно, но без высокомерия и без лишней "воды".
     - Пиши на том же языке, на котором написана вакансия.
+
+# Ручные письма HH: бюджет в СИМВОЛАХ, не точное число токенов.
+# Реальный расход Gemini отображается в /stats.
+cover_letters:
+  hh_user_agent: "PersonalLetterBot/1.0 (your-email@example.com)"
+  resume_chars: 3200
+  vacancy_chars: 5000
+  max_prompt_chars: 12000
+  max_output_tokens: 1000
