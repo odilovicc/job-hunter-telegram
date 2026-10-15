@@ -24,6 +24,7 @@ from ai_generator import create_ai_client, FALLBACK_COVER_LETTER
 from ai_gateway import AIGateway
 from hh_letters import LetterService
 from hh_handlers import HHHandlers, MENU
+from resume_storage import resume_path
 from history_scan import HistoryScanner, MessageGate
 
 # Пути считаются от расположения скрипта, а не от текущей рабочей директории —
@@ -88,8 +89,7 @@ except ValueError:
 # resume_path тоже разрешаем относительно BASE_DIR — иначе при запуске из
 # systemd/cron с чужим WorkingDirectory отправка падала бы с FileNotFoundError
 # уже ПОСЛЕ того, как вакансия помечена обработанной.
-_raw_resume_path = config["user_profile"]["resume_path"]
-RESUME_PATH = _raw_resume_path if os.path.isabs(_raw_resume_path) else os.path.join(BASE_DIR, _raw_resume_path)
+RESUME_PATH = resume_path(BASE_DIR, config)
 
 # Не падаем: бот всё равно полезен (фильтрует и показывает вакансии), резюме можно
 # положить позже, а неудачная отправка теперь возвращает кнопку для повтора.
@@ -752,7 +752,13 @@ async def main(mode="normal"):
     scanner = HistoryScanner(client, config["telegram"]["channels"], handle_message, ADMIN_CHAT_ID)
     scanner.register(ptb_app)
     hh_service = LetterService(db.conn, RESUME_PATH, get_ai_gateway(), config.get("cover_letters", {}))
-    HHHandlers(hh_service, ADMIN_CHAT_ID).register(ptb_app)
+    def use_uploaded_resume(path):
+        global RESUME_PATH
+        RESUME_PATH = str(path)
+
+    HHHandlers(hh_service, ADMIN_CHAT_ID,
+               upload_path=os.path.join(BASE_DIR, "uploads", "resume.pdf"),
+               on_resume_saved=use_uploaded_resume).register(ptb_app)
     ptb_app.add_handler(CallbackQueryHandler(button_handler))
     ptb_app.add_error_handler(error_handler)
 
@@ -769,7 +775,7 @@ async def main(mode="normal"):
     if RESUME_MISSING:
         startup_text += (
             f"\n\n⚠️ <b>Резюме не найдено</b>: <code>{html.escape(RESUME_PATH)}</code>\n"
-            f"Отправка откликов не заработает, пока файл не появится."
+            "Укажите user_profile.resume_path в config.yaml или пришлите боту резюме PDF файлом."
         )
 
     try:

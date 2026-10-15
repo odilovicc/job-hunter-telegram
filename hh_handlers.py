@@ -2,20 +2,24 @@
 import asyncio
 import json
 import logging
+import tempfile
+from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
-from hh_letters import fetch_vacancy, vacancy_id
+from hh_letters import fetch_vacancy, vacancy_id, read_resume
 
 log = logging.getLogger("vacancy_bot")
 MENU = ReplyKeyboardMarkup([["✉️ Письмо для HH", "📄 Мой профиль"], ["🔎 Скан истории"]], resize_keyboard=True)
 
 
 class HHHandlers:
-    def __init__(self, service, admin_id):
+    def __init__(self, service, admin_id, upload_path=None, on_resume_saved=None):
         self.service, self.admin_id = service, admin_id
         self.active = set()
+        self.upload_path = Path(upload_path or service.resume_path)
+        self.on_resume_saved = on_resume_saved
 
     def allowed(self, update):
         return (update.effective_user and update.effective_user.id == self.admin_id
@@ -27,6 +31,7 @@ class HHHandlers:
         app.add_handler(CommandHandler("letters", self.jobs))
         app.add_handler(CommandHandler("cancel", self.cancel))
         app.add_handler(CallbackQueryHandler(self.callback, pattern=r"^hh:"))
+        app.add_handler(MessageHandler(filters.Document.ALL, self.upload_resume))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text))
 
     async def start(self, update, context):
@@ -45,14 +50,24 @@ class HHHandlers:
     async def profile(self, update, context):
         if not self.allowed(update):
             return
+        context.user_data.pop("hh_waiting", None)
+        context.user_data.pop("hh_profile_hash", None)
         try:
             profile = await self.service.profile()
-        except Exception:
-            await update.effective_message.reply_text("Не удалось прочитать резюме. Проверьте resume_path и текстовый PDF (до 10 МБ, 30 страниц).")
+        except Exception as exc:
+            log.warning("Resume read failed (%s)", type(exc).__name__)
+            reason = str(exc) if isinstance(exc, ValueError) else "Файл отсутствует, недоступен или не является читаемым PDF."
+            await update.effective_message.reply_text(
+                f"Не удалось прочитать резюме. {reason}\n"
+                f"Текущий путь: {self.service.resume_path}\n"
+                "Укажите user_profile.resume_path в config.yaml и перезапустите бота. "
+                "Относительный путь считается от папки проекта; файл должен быть на машине бота.\n"
+                "Или пришлите сюда резюме файлом: текстовый PDF до 10 МБ и 30 страниц. "
+                "Я скачаю его и обновлю профиль автоматически.")
             return
         await update.effective_message.reply_text(
             "Факты, извлечённые из PDF локально. Проверьте текст: только эти данные будут основой письма. "
-            "Для исправления замените PDF и снова вызовите /resume.")
+            "Чтобы обновить резюме, пришлите сюда новый PDF файлом (до 10 МБ, 30 страниц).")
         text = "\n".join(profile["facts"])
         for offset in range(0, len(text), 3500):
             await update.effective_message.reply_text(text[offset:offset + 3500])
@@ -60,6 +75,39 @@ class HHHandlers:
         await update.effective_message.reply_text(
             "Профиль подтверждён." if profile["approved"] else "Данные извлечены верно?",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Подтвердить профиль", callback_data="hh:approve")]]))
+
+    async def upload_resume(self, update, context):
+        if not self.allowed(update):
+            return
+        document = update.effective_message.document
+        if not (document.file_name or "").lower().endswith(".pdf"):
+            await update.effective_message.reply_text("Пришлите резюме файлом в формате PDF.")
+            return
+        if document.file_size and document.file_size > 10 * 1024 * 1024:
+            await update.effective_message.reply_text("Резюме больше 10 МБ. Пришлите PDF меньшего размера.")
+            return
+        temporary = None
+        try:
+            self.upload_path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=self.upload_path.parent, suffix=".pdf", delete=False) as file:
+                temporary = Path(file.name)
+            remote = await document.get_file()
+            await remote.download_to_drive(custom_path=temporary)
+            await asyncio.to_thread(read_resume, temporary)
+            temporary.replace(self.upload_path)
+            self.service.resume_path = str(self.upload_path)
+            if self.on_resume_saved:
+                self.on_resume_saved(self.upload_path)
+        except Exception as exc:
+            log.warning("Resume upload failed (%s)", type(exc).__name__)
+            reason = str(exc) if isinstance(exc, ValueError) else "Не удалось скачать, прочитать или сохранить PDF. Попробуйте ещё раз."
+            await update.effective_message.reply_text(reason + " Предыдущее резюме не заменено.")
+            return
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        await update.effective_message.reply_text("Резюме сохранено и будет использоваться для новых откликов, в том числе после перезапуска.")
+        await self.profile(update, context)
 
     async def jobs(self, update, context):
         if not self.allowed(update):

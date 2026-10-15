@@ -21,3 +21,6 @@ bot.log*
 
 # Personal resume (contains PII, don't push to a public repo)
 resume.pdf
+
+# Resumes uploaded through Telegram
+uploads/
