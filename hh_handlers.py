@@ -3,14 +3,25 @@ import asyncio
 import json
 import logging
 import tempfile
+import time
+import traceback
+import re
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.error import TimedOut
 from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from hh_letters import fetch_vacancy, vacancy_id, read_resume
 
 log = logging.getLogger("vacancy_bot")
+def safe_traceback(exc):
+    """Keep stack/cause diagnostics without Telegram download URLs or bot tokens."""
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    text = re.sub(r"https?://[^\s\"'<>]+", "[URL redacted]", text)
+    return re.sub(r"\b\d+:[A-Za-z0-9_-]{20,}", "[bot token redacted]", text)
+
+
 MENU = ReplyKeyboardMarkup([["✉️ Письмо для HH", "📄 Мой профиль"], ["🔎 Скан истории"]], resize_keyboard=True)
 
 
@@ -55,7 +66,7 @@ class HHHandlers:
         try:
             profile = await self.service.profile()
         except Exception as exc:
-            log.warning("Resume read failed (%s)", type(exc).__name__)
+            log.warning("Resume read failed path=%s\n%s", self.service.resume_path, safe_traceback(exc))
             reason = str(exc) if isinstance(exc, ValueError) else "Файл отсутствует, недоступен или не является читаемым PDF."
             await update.effective_message.reply_text(
                 f"Не удалось прочитать резюме. {reason}\n"
@@ -87,25 +98,50 @@ class HHHandlers:
             await update.effective_message.reply_text("Резюме больше 10 МБ. Пришлите PDF меньшего размера.")
             return
         temporary = None
+        started = time.monotonic()
+        stage = "prepare"
+        log.info("Resume upload started size=%s destination=%s", document.file_size, self.upload_path)
         try:
             self.upload_path.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(dir=self.upload_path.parent, suffix=".pdf", delete=False) as file:
                 temporary = Path(file.name)
-            remote = await document.get_file()
-            await remote.download_to_drive(custom_path=temporary)
+            for attempt in range(1, 4):
+                try:
+                    stage = "get_file"
+                    log.info("Resume upload stage=%s attempt=%d/3 elapsed=%.1fs", stage, attempt, time.monotonic() - started)
+                    remote = await document.get_file(connect_timeout=30, read_timeout=60,
+                                                     write_timeout=30, pool_timeout=30)
+                    stage = "download"
+                    log.info("Resume upload stage=%s attempt=%d/3 elapsed=%.1fs", stage, attempt, time.monotonic() - started)
+                    await remote.download_to_drive(custom_path=temporary, connect_timeout=30,
+                                                   read_timeout=120, write_timeout=30, pool_timeout=30)
+                    break
+                except TimedOut as exc:
+                    log.warning("Resume upload timeout stage=%s attempt=%d/3 elapsed=%.1fs\n%s",
+                                stage, attempt, time.monotonic() - started, safe_traceback(exc))
+                    if attempt == 3:
+                        raise
+                    await asyncio.sleep(attempt * 2)
+            stage = "validate_pdf"
+            log.info("Resume upload stage=%s bytes=%d elapsed=%.1fs", stage, temporary.stat().st_size, time.monotonic() - started)
             await asyncio.to_thread(read_resume, temporary)
+            stage = "replace"
             temporary.replace(self.upload_path)
             self.service.resume_path = str(self.upload_path)
             if self.on_resume_saved:
                 self.on_resume_saved(self.upload_path)
         except Exception as exc:
-            log.warning("Resume upload failed (%s)", type(exc).__name__)
+            log.warning("Resume upload failed stage=%s elapsed=%.1fs destination=%s\n%s",
+                        stage, time.monotonic() - started, self.upload_path, safe_traceback(exc))
             reason = str(exc) if isinstance(exc, ValueError) else "Не удалось скачать, прочитать или сохранить PDF. Попробуйте ещё раз."
+            if isinstance(exc, TimedOut):
+                reason = "Telegram не ответил вовремя после трёх попыток. Попробуйте отправить PDF ещё раз."
             await update.effective_message.reply_text(reason + " Предыдущее резюме не заменено.")
             return
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+        log.info("Resume upload saved destination=%s elapsed=%.1fs", self.upload_path, time.monotonic() - started)
         await update.effective_message.reply_text("Резюме сохранено и будет использоваться для новых откликов, в том числе после перезапуска.")
         await self.profile(update, context)
 

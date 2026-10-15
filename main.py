@@ -114,6 +114,7 @@ gemini_http_options = None
 # base_url/headers для Bot API (python-telegram-bot) через воркер — None означает
 # "обычный прямой api.telegram.org", как раньше.
 ptb_base_url = None
+ptb_base_file_url = None
 ptb_proxy_headers = None
 
 if network_mode == "cloudflare_worker":
@@ -142,6 +143,7 @@ if network_mode == "cloudflare_worker":
     # Раньше это не проксировалось вообще, из-за чего Telethon работал, а
     # python-telegram-bot падал с ConnectTimeout/TimedOut на getMe().
     ptb_base_url = f"{worker_base}/telegram-bot/bot"
+    ptb_base_file_url = f"{worker_base}/telegram-bot/file/bot"
     ptb_proxy_headers = {"X-Proxy-Token": proxy_token}
     log.info(f"Режим сети: cloudflare_worker ({worker_base})")
 else:
@@ -217,6 +219,7 @@ def _make_standalone_bot():
         return Bot(
             token=ADMIN_BOT_TOKEN,
             base_url=ptb_base_url,
+            base_file_url=ptb_base_file_url,
             request=HTTPXRequest(httpx_kwargs={"headers": ptb_proxy_headers}),
         )
     return Bot(token=ADMIN_BOT_TOKEN)
@@ -732,7 +735,7 @@ def build_ptb_application():
     builder = Application.builder().token(ADMIN_BOT_TOKEN)
 
     if ptb_base_url:
-        builder = builder.base_url(ptb_base_url)
+        builder = builder.base_url(ptb_base_url).base_file_url(ptb_base_file_url)
         builder = builder.request(HTTPXRequest(httpx_kwargs={"headers": ptb_proxy_headers}))
         builder = builder.get_updates_request(HTTPXRequest(httpx_kwargs={"headers": ptb_proxy_headers}))
 

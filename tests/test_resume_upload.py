@@ -4,7 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from hh_handlers import HHHandlers
+from hh_handlers import HHHandlers, safe_traceback
+from telegram.error import TimedOut
 from resume_storage import resume_path
 
 
@@ -18,7 +19,7 @@ class ResumeUploadTests(unittest.IsolatedAsyncioTestCase):
                                        profile=AsyncMock(side_effect=FileNotFoundError))
         self.saved = Mock()
         self.handler = HHHandlers(self.service, 123, self.target, self.saved)
-        async def download(custom_path):
+        async def download(custom_path, **kwargs):
             Path(custom_path).write_bytes(b'new resume')
         self.remote = SimpleNamespace(download_to_drive=AsyncMock(side_effect=download))
         self.document = SimpleNamespace(file_name='../../resume.PDF', file_size=100,
@@ -73,6 +74,33 @@ class ResumeUploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('пришлите', text)
         self.assertIn(self.service.resume_path, text)
         self.assertNotIn('hh_waiting', self.context.user_data)
+
+    async def test_timeout_retries_then_succeeds(self):
+        self.document.get_file.side_effect = [TimedOut(), self.remote]
+        with patch('hh_handlers.asyncio.sleep', new_callable=AsyncMock), patch('hh_handlers.read_resume'):
+            await self.handler.upload_resume(self.update, self.context)
+        self.assertEqual(self.document.get_file.await_count, 2)
+        self.assertEqual(self.target.read_bytes(), b'new resume')
+        self.assertEqual(self.remote.download_to_drive.call_args.kwargs['read_timeout'], 120)
+
+    async def test_download_timeouts_log_stage_and_keep_old_resume(self):
+        self.target.parent.mkdir()
+        self.target.write_bytes(b'old')
+        self.remote.download_to_drive.side_effect = TimedOut()
+        with patch('hh_handlers.asyncio.sleep', new_callable=AsyncMock), self.assertLogs('vacancy_bot', level='INFO') as logs:
+            await self.handler.upload_resume(self.update, self.context)
+        self.assertEqual(self.remote.download_to_drive.await_count, 3)
+        self.assertEqual(self.target.read_bytes(), b'old')
+        self.assertTrue(any('stage=download attempt=3/3' in line for line in logs.output))
+        self.assertTrue(any('Traceback' in line for line in logs.output))
+        self.saved.assert_not_called()
+
+    def test_traceback_redacts_download_url_and_token(self):
+        token = '12345:' + 'a' * 35
+        result = safe_traceback(RuntimeError('https://api.telegram.org/file/bot' + token + '/cv.pdf ' + token))
+        self.assertNotIn(token, result)
+        self.assertNotIn('cv.pdf', result)
+        self.assertIn('RuntimeError', result)
 
     def test_missing_empty_relative_and_home_paths(self):
         for config in ({}, {'user_profile': None}, {'user_profile': {'resume_path': ''}}):
