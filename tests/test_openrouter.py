@@ -52,6 +52,16 @@ class OpenRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('secret', str(error.exception))
         self.assertEqual(self.counts['ai_requests'], 1)
 
+    async def test_404_hint(self):
+        cases = ((httpx.Response(404, text='Not found'), 'not_json'),
+                 (httpx.Response(404, json={'error': {'message': 'No endpoints found matching your data policy'}}), 'data_policy'),
+                 (httpx.Response(404, json={'error': {'message': 'No endpoints found for x'}}), 'model'))
+        for response, hint in cases:
+            with self.subTest(hint=hint), self.assertRaises(OpenRouterError) as error:
+                await self.generate(lambda request, r=response: r)
+            self.assertEqual(error.exception.hint, hint)
+            self.assertNotIn('endpoints', str(error.exception))
+
     async def test_error_inside_success_response(self):
         with self.assertRaises(OpenRouterError) as error:
             await self.generate(lambda request: httpx.Response(200, json={'error': {'code': 403}}))
