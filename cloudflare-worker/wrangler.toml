@@ -4,3 +4,9 @@ compatibility_date = "2024-09-23"
 
 # TCP Sockets API (`cloudflare:sockets`, использован в src/index.js для
 # /mtproto) требует плана Workers, поддерживающего исходящие TCP-сокеты.
+
+# OpenRouter и подобные API отвечают 403 «Access denied by security policy» на
+# запросы из РФ. Воркер по умолчанию выполняется в дата-центре рядом с клиентом
+# (то есть тоже в РФ), поэтому закрепляем его за регионом США.
+[placement]
+region = "aws:us-east-1"

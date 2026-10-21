@@ -141,6 +141,12 @@ async function proxyTo(request, env, { stripPrefix, upstreamOrigin }) {
   const headers = new Headers(request.headers);
   headers.delete("X-Proxy-Token");
   headers.delete("Host");
+  // Апстрим (в первую очередь OpenRouter) блокирует по региону клиента, поэтому
+  // не передаём ему IP и страну того, кто обратился к воркеру.
+  for (const name of ["X-Forwarded-For", "X-Real-IP", "True-Client-IP", "CF-Connecting-IP",
+                      "CF-IPCountry", "Forwarded", "X-Forwarded-Proto", "X-Forwarded-Host"]) {
+    headers.delete(name);
+  }
 
   const init = {
     method: request.method,
@@ -177,6 +183,13 @@ export default {
 
     if (url.pathname === "/mtproto") {
       return handleMtproto(request, env);
+    }
+    if (url.pathname === "/trace") {
+      // Диагностика: из какого дата-центра и страны воркер ходит наружу (поля colo=, loc=).
+      if (!isAuthorized(request, env)) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      return fetch("https://www.cloudflare.com/cdn-cgi/trace");
     }
     if (url.pathname.startsWith("/openrouter/")) {
       return proxyTo(request, env, {
