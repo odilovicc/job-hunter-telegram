@@ -178,6 +178,12 @@ export default {
     if (url.pathname === "/mtproto") {
       return handleMtproto(request, env);
     }
+    if (url.pathname.startsWith("/openrouter/")) {
+      return proxyTo(request, env, {
+        stripPrefix: /^\/openrouter/,
+        upstreamOrigin: "https://openrouter.ai",
+      });
+    }
     if (url.pathname.startsWith("/gemini")) {
       return handleGemini(request, env);
     }

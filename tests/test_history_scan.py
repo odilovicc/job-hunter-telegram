@@ -1,11 +1,15 @@
 import ast
 import asyncio
 import logging
+import sqlite3
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 
 from history_scan import HistoryScanner, MessageGate
 
@@ -82,6 +86,79 @@ class ScanTests(unittest.IsolatedAsyncioTestCase):
             await scanner.menu(update, SimpleNamespace(args=[value], user_data={}))
             self.assertIn('Укажите число', self.message.reply_text.await_args.args[0])
         self.assertIsNone(scanner.task)
+
+    async def test_results_are_saved_until_completion_and_reviewed_one_at_a_time(self):
+        now = datetime.now(timezone.utc)
+        scanner = self.setup_scanner([SimpleNamespace(id=i, date=now) for i in range(2)])
+        bot = SimpleNamespace(send_message=AsyncMock())
+        self.message.get_bot = lambda: bot
+        async def collect(item, delivery):
+            bot.send_message.assert_not_awaited()
+            await delivery.send_message(chat_id=123, text=f'Vacancy {item.id}',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Send', callback_data=f'send_2_{item.id}')]]))
+            return 'delivered'
+        scanner.process = collect
+        await scanner.run(self.message)
+        bot.send_message.assert_not_awaited()
+        first = self.message.reply_text.await_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data
+        await scanner.show(self.message, int(first.split(':')[-1]))
+        bot.send_message.assert_awaited_once()
+        card = bot.send_message.await_args.kwargs
+        self.assertEqual(card['text'], 'Vacancy 0')
+        self.assertEqual(card['reply_markup'].inline_keyboard[0][0].callback_data, 'send_2_0')
+        next_id = int(card['reply_markup'].inline_keyboard[-1][0].callback_data.split(':')[-1])
+        await scanner.show(self.message, next_id)
+        card = bot.send_message.await_args.kwargs
+        self.assertEqual(card['text'], 'Vacancy 1')
+        self.assertEqual(card['reply_markup'].inline_keyboard[-1][0].callback_data, 'scan:results')
+
+    async def test_batches_survive_restart_and_navigation_stays_in_batch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'scan.db')
+            conn = sqlite3.connect(path)
+            scanner = HistoryScanner(None, [], None, 123, conn=conn)
+            scanner.run_id = 1
+            await scanner.send_message(chat_id=123, text='First scan')
+            scanner.run_id = 2
+            await scanner.send_message(chat_id=123, text='Second scan')
+            conn.close()
+            conn = sqlite3.connect(path)
+            restarted = HistoryScanner(None, [], None, 123, conn=conn)
+            bot = SimpleNamespace(send_message=AsyncMock())
+            message = SimpleNamespace(get_bot=lambda: bot, reply_text=AsyncMock())
+            await restarted.show(message, 1)
+            card = bot.send_message.await_args.kwargs
+            self.assertEqual(card['text'], 'First scan')
+            self.assertEqual(card['reply_markup'].inline_keyboard[-1][0].callback_data, 'scan:results')
+            conn.close()
+
+    async def test_cannot_open_current_batch_but_can_open_previous_batch(self):
+        scanner = self.setup_scanner([])
+        scanner.run_id = 1
+        await scanner.send_message(chat_id=123, text='Previous')
+        scanner.run_id = 2
+        await scanner.send_message(chat_id=123, text='Current')
+        scanner.task = Mock(done=lambda: False)
+        bot = SimpleNamespace(send_message=AsyncMock())
+        self.message.get_bot = lambda: bot
+        await scanner.show(self.message, 2)
+        bot.send_message.assert_not_awaited()
+        await scanner.show(self.message, 1)
+        self.assertEqual(bot.send_message.await_args.kwargs['text'], 'Previous')
+
+    async def test_send_and_skip_keep_scan_navigation(self):
+        tree = ast.parse(Path('main.py').read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == 'safe_edit')
+        env = dict(InlineKeyboardMarkup=InlineKeyboardMarkup, ParseMode=ParseMode,
+                   TelegramError=RuntimeError, log=logging.getLogger('test'))
+        exec(compile(ast.Module(body=[node], type_ignores=[]), 'main.py', 'exec'), env)
+        query = SimpleNamespace(edit_message_text=AsyncMock(), message=SimpleNamespace(reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('Send', callback_data='send_1_2')],
+            [InlineKeyboardButton('Next', callback_data='scan:view:3')]])))
+        await env['safe_edit'](query, 'Skipped')
+        rows = query.edit_message_text.await_args.kwargs['reply_markup'].inline_keyboard
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0].callback_data, 'scan:view:3')
 
 
 class ProcessingTests(unittest.IsolatedAsyncioTestCase):

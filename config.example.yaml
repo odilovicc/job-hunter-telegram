@@ -156,6 +156,9 @@ filters:
         label: "джун"
 
 ai:
+  provider: "gemini" # gemini или openrouter; старые конфиги используют gemini
+  openrouter_api_key: "" # либо переменная окружения OPENROUTER_API_KEY
+  openrouter_model: "openrouter/free" # бесплатный роутер; можно указать модель с :free
   gemini_api_key: ""
   model: "gemini-3.6-flash"
   min_interval_sec: 2
@@ -172,7 +175,7 @@ ai:
     - Пиши на том же языке, на котором написана вакансия.
 
 # Ручные письма HH: бюджет в СИМВОЛАХ, не точное число токенов.
-# Реальный расход Gemini отображается в /stats.
+# Реальный расход ИИ отображается в /stats.
 cover_letters:
   hh_user_agent: "PersonalLetterBot/1.0 (your-email@example.com)"
   resume_chars: 3200

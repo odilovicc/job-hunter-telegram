@@ -1,6 +1,8 @@
 """On-demand channel history scanning, with one bounded background scan."""
 import asyncio
 import logging
+import json
+import sqlite3
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -30,7 +32,15 @@ class MessageGate:
 
 
 class HistoryScanner:
-    def __init__(self, client, channels, process, admin_id, max_days=365):
+    def __init__(self, client, channels, process, admin_id, max_days=365, conn=None):
+        self.conn = conn or sqlite3.connect(":memory:")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS scan_results (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(scan_results)")}
+        if "run_id" not in columns:
+            self.conn.execute("ALTER TABLE scan_results ADD COLUMN run_id INTEGER NOT NULL DEFAULT 0")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS scan_runs (id INTEGER PRIMARY KEY, started_at TEXT NOT NULL)")
+        self.conn.commit()
+        self.run_id = 0
         self.client = client
         self.channels = list(dict.fromkeys(channels))
         self.process = process
@@ -57,6 +67,7 @@ class HistoryScanner:
     def register(self, app):
         # Register before HH's catch-all text handler and legacy callbacks.
         app.add_handler(CommandHandler("scan", self.menu))
+        app.add_handler(CommandHandler("scan_results", self.results))
         app.add_handler(CommandHandler("scan_status", self.status))
         app.add_handler(CommandHandler("scan_stop", self.stop))
         app.add_handler(MessageHandler(filters.Regex("^" + SCAN_BUTTON + "$"), self.menu))
@@ -98,6 +109,7 @@ class HistoryScanner:
         rows = [buttons[i:i+3] for i in range(0, len(buttons), 3)]
         rows.append([InlineKeyboardButton("Статус", callback_data="scan:status"),
                      InlineKeyboardButton("Остановить", callback_data="scan:stop")])
+        rows.append([InlineKeyboardButton("Сохранённые подборки", callback_data="scan:results")])
         await update.effective_message.reply_text(
             "За сколько дней проверить все настроенные каналы?\n"
             "Период отсчитывается назад от момента запуска: 3 дня = последние 72 часа.\n"
@@ -116,9 +128,13 @@ class HistoryScanner:
         self.end_time = datetime.now(timezone.utc)
         self.start_time = since or self.end_time - timedelta(days=days)
         self.last_progress = time.monotonic()
+        self.run_id = self.conn.execute("INSERT INTO scan_runs(started_at) VALUES (?)",
+                                        (self.end_time.isoformat(),)).lastrowid
+        self.conn.commit()
         # Reserve before the first await, including concurrent startup/manual requests.
         self.task = context.application.create_task(self.run(message), update=None)
-        await message.reply_text("Сканирование запущено. /scan_status — прогресс, /scan_stop — остановить.")
+        await message.reply_text("Сканирование запущено. Подходящие вакансии соберу в подборку и покажу после завершения.\n"
+                                 "/scan_status — прогресс, /scan_stop — остановить.")
 
     async def status(self, update, context):
         if self.allowed(update):
@@ -136,6 +152,10 @@ class HistoryScanner:
             return
         await update.callback_query.answer()
         parts = update.callback_query.data.split(":")
+        if len(parts) == 3 and parts[1] == "view" and parts[2].isdigit():
+            return await self.show(update.effective_message, int(parts[2]))
+        if parts == ["scan", "results"]:
+            return await self.results(update, context)
         if parts == ["scan", "status"]:
             return await self.status(update, context)
         if parts == ["scan", "stop"]:
@@ -146,9 +166,57 @@ class HistoryScanner:
                 context.user_data.pop("hh_waiting", None)
                 await self.start(update.effective_message, context, days)
 
-    async def notify(self, message, text):
+    async def send_message(self, **payload):
+        # The normal processing path marks a vacancy processed only after this
+        # durable write. A restart cannot discard a collected vacancy.
+        markup = payload.get("reply_markup")
+        if markup:
+            payload["reply_markup"] = markup.to_dict()
+        self.conn.execute("INSERT INTO scan_results(payload, run_id) VALUES (?, ?)",
+                          (json.dumps(payload), self.run_id))
+        self.conn.commit()
+
+    async def results(self, update, context):
+        if self.allowed(update):
+            rows = self.conn.execute(
+                "SELECT r.run_id, MIN(r.id), COUNT(*), s.started_at FROM scan_results r "
+                "LEFT JOIN scan_runs s ON s.id=r.run_id GROUP BY r.run_id ORDER BY r.run_id DESC LIMIT 10"
+            ).fetchall()
+            if not rows:
+                await update.effective_message.reply_text("Сохранённых вакансий пока нет. Запустите /scan.")
+                return
+            buttons = [[InlineKeyboardButton(
+                f"{datetime.fromisoformat(started):%d.%m %H:%M} UTC · {count} вакансий" if started else f"Подборка · {count} вакансий",
+                callback_data=f"scan:view:{first}")] for _, first, count, started in rows]
+            await update.effective_message.reply_text("Выберите подборку:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    async def show(self, message, identifier):
+        row = self.conn.execute("SELECT id, payload, run_id FROM scan_results WHERE id = ?",
+                                (identifier,)).fetchone()
+        if not row:
+            await message.reply_text("Все сохранённые вакансии просмотрены. /scan_results — открыть подборку заново.")
+            return
+        key, raw, run_id = row
+        if self.running and run_id == self.run_id:
+            await message.reply_text("Подборка готовится. Дождитесь завершения сканирования.")
+            return
+        payload = json.loads(raw)
+        rows = []
+        # Review keeps the existing per-vacancy actions; sending still requires
+        # the owner's explicit click, never happens during scanning.
+        for buttons in payload.get("reply_markup", {}).get("inline_keyboard", []):
+            rows.append([InlineKeyboardButton(**button) for button in buttons])
+        next_row = self.conn.execute("SELECT MIN(id) FROM scan_results WHERE run_id=? AND id>?", (run_id, key)).fetchone()
+        if next_row[0] is not None:
+            rows.append([InlineKeyboardButton("Следующая вакансия →", callback_data=f"scan:view:{next_row[0]}")])
+        else:
+            rows.append([InlineKeyboardButton("Все вакансии подборки просмотрены · К подборкам", callback_data="scan:results")])
+        payload["reply_markup"] = InlineKeyboardMarkup(rows)
+        await message.get_bot().send_message(**payload)
+
+    async def notify(self, message, text, **kwargs):
         try:
-            await message.reply_text(text)
+            await message.reply_text(text, **kwargs)
         except Exception:
             log.warning("Не удалось доставить прогресс сканирования", exc_info=True)
 
@@ -170,7 +238,7 @@ class HistoryScanner:
                             continue
                         self.counts['read'] += 1
                         try:
-                            outcome = await self.process(item, message.get_bot())
+                            outcome = await self.process(item, self)
                             self.counts[outcome or 'empty'] += 1
                         except Exception:
                             self.counts['failed'] += 1
@@ -185,7 +253,15 @@ class HistoryScanner:
                 if not self.stop_requested:
                     self.completed += 1
             self.channel = ""
-            await self.notify(message, self.report("Сканирование остановлено" if self.stop_requested else "Сканирование завершено"))
+            first = self.conn.execute("SELECT MIN(id) FROM scan_results WHERE run_id=?", (self.run_id,)).fetchone()[0]
+            heading = "Сканирование остановлено" if self.stop_requested else "Сканирование завершено"
+            if first is not None:
+                heading += ", вот ваши подходящие вакансии"
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton("Посмотреть вакансии", callback_data=f"scan:view:{first}")]])
+            else:
+                heading += ". Новых подходящих вакансий нет."
+                markup = None
+            await self.notify(message, self.report(heading) + "\n/scan_results — сохранённые подборки.", reply_markup=markup)
         except asyncio.CancelledError:
             raise
 

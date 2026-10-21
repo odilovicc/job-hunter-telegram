@@ -69,3 +69,10 @@ network:
   после обновлений платформы `import { connect } from "cloudflare:sockets"`
   перестанет работать как ожидается, проверьте актуальную документацию:
   https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/
+
+### OpenRouter
+
+Маршрут `/openrouter/*` проксирует запросы на `https://openrouter.ai/*`.
+Он защищён тем же `X-Proxy-Token`; Bearer-ключ OpenRouter передаётся в
+`Authorization`. После включения `ai.provider: openrouter` обновите Worker,
+если бот использует режим `cloudflare_worker` (иначе старый Worker вернёт 404).

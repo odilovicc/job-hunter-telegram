@@ -1,5 +1,6 @@
 import logging
 from google import genai
+from ai_gateway import DEFAULT_GEMINI_MODEL
 
 log = logging.getLogger("vacancy_bot")
 
@@ -16,12 +17,12 @@ def create_ai_client(api_key, http_options=None):
     return genai.Client(api_key=api_key)
 
 def generate_cover_letter(vacancy_text, config, ai_client):
-    """Генерация сопроводительного письма через Gemini 2.0 Flash."""
+    """Legacy synchronous caller; use the same model setting as AIGateway."""
     prompt = config["ai"]["prompt_template"].format(vacancy_text=vacancy_text)
 
     try:
         response = ai_client.models.generate_content(
-            model='gemini-3.6-flash',
+            model=config["ai"].get("model") or DEFAULT_GEMINI_MODEL,
             contents=prompt,
         )
         return response.text.strip()

@@ -31,9 +31,17 @@ def encode(value):
 
 
 def vacancy_id(url):
-    parsed = urlparse(url.strip())
-    if (parsed.scheme != "https" or parsed.hostname not in ("hh.uz", "www.hh.uz")
-            or parsed.username or parsed.password or parsed.port not in (None, 443)):
+    # Extract a link from pasted prose/Markdown and discard tracking parameters.
+    match = re.search(r"(?:https?://)?(?:[a-z0-9-]+\.)*hh\.(?:uz|ru|kz)/vacancy/[^\s<>]+", url, re.I)
+    candidate = match.group(0).rstrip('.,;!)]}\"\'') if match else url.strip()
+    # Never reinterpret a suffix inside another URL or a credentialed URL.
+    if match and match.start() and url[match.start() - 1] not in " \n\t([<":
+        raise ValueError("Пришлите ссылку HH на вакансию.")
+    parsed = urlparse(candidate if "://" in candidate else "https://" + candidate)
+    host = (parsed.hostname or "").lower()
+    allowed = any(host == domain or host.endswith("." + domain) for domain in ("hh.uz", "hh.ru", "hh.kz"))
+    if (parsed.scheme != "https" or not allowed or parsed.username or parsed.password
+            or parsed.port not in (None, 443)):
         raise ValueError("Пришлите ссылку вида https://hh.uz/vacancy/123456.")
     match = re.fullmatch(r"/vacancy/(\d{1,20})/?", parsed.path)
     if not match:
@@ -119,17 +127,74 @@ def read_resume(path):
     return {"hash": hashlib.sha256(raw).hexdigest(), "facts": facts}
 
 
+class JobPostingParser(HTMLParser):
+    """Read only structured vacancy data, never captcha/navigation page text."""
+    def __init__(self):
+        super().__init__()
+        self.capture = False
+        self.buffer = []
+        self.jobs = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "script" and dict(attrs).get("type") == "application/ld+json":
+            self.capture = True
+            self.buffer = []
+
+    def handle_data(self, data):
+        if self.capture:
+            self.buffer.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "script" and self.capture:
+            self.capture = False
+            try:
+                self.collect(json.loads("".join(self.buffer)))
+            except (ValueError, TypeError):
+                pass
+
+    def collect(self, value):
+        if isinstance(value, list):
+            for item in value:
+                self.collect(item)
+        elif isinstance(value, dict):
+            if value.get("@type") == "JobPosting" and value.get("description"):
+                self.jobs.append(value)
+            self.collect(value.get("@graph"))
+
+
+async def bounded_body(client, url, user_agent):
+    async with client.stream("GET", url, headers={"User-Agent": user_agent}) as response:
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            body.extend(chunk)
+            if len(body) > 2_000_000:
+                raise ValueError("Слишком большой ответ HH. Пришлите текст вакансии.")
+        return response.status_code, bytes(body)
+
+
 async def fetch_vacancy(identifier, user_agent):
+    if not re.fullmatch(r"\d{1,20}", identifier):
+        raise ValueError("Некорректный ID вакансии HH.")
     async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
-        async with client.stream("GET", f"https://api.hh.ru/vacancies/{identifier}",
-                                 headers={"User-Agent": user_agent}) as response:
-            if response.status_code != 200:
-                raise ValueError(f"HH не отдал вакансию (HTTP {response.status_code}). Пришлите текст вакансии сообщением.")
-            body = bytearray()
-            async for chunk in response.aiter_bytes():
-                body.extend(chunk)
-                if len(body) > 2_000_000:
-                    raise ValueError("Слишком большой ответ HH. Пришлите текст вакансии.")
+        status, body = await bounded_body(client, f"https://api.hh.ru/vacancies/{identifier}", user_agent)
+        if status == 403:
+            # Public page is a separate supported source; no captcha bypass or
+            # arbitrary user-supplied URL fetching.
+            for host in ("hh.uz", "hh.ru"):
+                try:
+                    page_status, page = await bounded_body(client, f"https://{host}/vacancy/{identifier}", user_agent)
+                except httpx.HTTPError:
+                    continue
+                if page_status == 200:
+                    parser = JobPostingParser()
+                    parser.feed(page.decode("utf-8", errors="replace"))
+                    if parser.jobs:
+                        job = parser.jobs[0]
+                        return {"id": identifier, "name": job.get("title", ""),
+                                "company": (job.get("hiringOrganization") or {}).get("name", ""),
+                                "skills": [], "description": plain_html(job["description"])}
+        if status != 200:
+            raise ValueError(f"HH не отдал вакансию (HTTP {status}). Пришлите текст вакансии сообщением.")
     data = json.loads(body)
     if data.get("archived"):
         raise ValueError("Вакансия в архиве. Можно прислать её текст для подготовки письма.")
@@ -205,7 +270,7 @@ class LetterService:
         prompt = encode(payload)
         if len(prompt) > int(self.config.get("max_prompt_chars", 12000)):
             raise ValueError("Данные превышают бюджет запроса. Пришлите более короткий текст вакансии.")
-        key = digest(encode([vacancy, profile["hash"], PROMPT_VERSION, self.gateway.model,
+        key = digest(encode([vacancy, profile["hash"], PROMPT_VERSION, getattr(self.gateway, "provider", "gemini"), self.gateway.model,
                              "vacancy-language", mode, prompt]))
         self.conn.execute("INSERT OR IGNORE INTO hh_letters(cache_key,vacancy,profile_hash,prompt,status) VALUES (?,?,?,?, 'pending')",
                           (key, encode(vacancy), profile["hash"], prompt))

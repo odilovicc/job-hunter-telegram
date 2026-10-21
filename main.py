@@ -8,6 +8,7 @@ import traceback
 import yaml
 import qrcode
 import re
+import signal
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient, events
@@ -159,7 +160,15 @@ client = TelegramClient(
     config["telegram"]["api_hash"],
     **telethon_kwargs
 )
-ai_client = create_ai_client(config["ai"]["gemini_api_key"], http_options=gemini_http_options)
+ai_provider = config["ai"].get("provider", "gemini").strip().lower()
+if ai_provider == "openrouter":
+    from openrouter_client import OpenRouterClient
+    ai_client = OpenRouterClient(config["ai"], network_cfg)
+elif ai_provider == "gemini":
+    ai_client = create_ai_client(config["ai"]["gemini_api_key"], http_options=gemini_http_options)
+else:
+    raise SystemExit("ai.provider должен быть gemini или openrouter")
+log.info("AI provider=%s", ai_provider)
 
 # Множество юзернеймов каналов (lower, без @) для фильтрации в extract_contact
 channel_usernames = {ch.lstrip("@").lower() for ch in config["telegram"]["channels"]}
@@ -277,6 +286,17 @@ class TelegramAlertHandler(logging.Handler):
 
 log.addHandler(TelegramAlertHandler())
 
+
+async def notify_shutdown(reason):
+    """Предупреждает админа, что бот останавливается, и называет причину."""
+    await notify_admin(f"🛑 <b>Бот отключается</b>\nПричина: {html.escape(reason)}")
+
+
+def _raise_on_sigterm(signum, frame):
+    # `kill`/systemd/docker stop шлют SIGTERM: по умолчанию процесс умирает молча.
+    # Превращаем его в KeyboardInterrupt, чтобы он попал в общий обработчик ниже.
+    raise KeyboardInterrupt(signal.Signals(signum).name)
+
 _ai_gateway = None
 
 
@@ -298,12 +318,13 @@ def extract_contact(text):
 
 
 async def generate_letter(vacancy_text):
-    """Мониторинг использует ту же очередь Gemini, что и ручные письма."""
+    """Мониторинг использует ту же очередь ИИ, что и ручные письма."""
     try:
         prompt = config["ai"]["prompt_template"].format(vacancy_text=vacancy_text)
         letter = await get_ai_gateway().generate(prompt)
     except Exception as exc:
-        log.warning("Ошибка Gemini при мониторинге (%s)", type(exc).__name__)
+        log.warning("Ошибка ИИ provider=%s model=%s code=%s (%s)", ai_provider, get_ai_gateway().model,
+                    getattr(exc, "code", None), type(exc).__name__)
         letter = FALLBACK_COVER_LETTER
 
     # Существующий мониторинг сохраняет явную отметку шаблонного письма.
@@ -314,12 +335,14 @@ async def generate_letter(vacancy_text):
     return letter, False
 
 
-def build_keyboard(chat_id, msg_id, has_contact):
+def build_keyboard(chat_id, msg_id, has_contact, vacancy_url=None):
     """Кнопки под отчётом. chat_id зашит в callback_data, т.к. message.id уникален
     только в пределах одного канала — одинаковые id из разных каналов иначе
     конфликтуют."""
     suffix = f"{chat_id}_{msg_id}"
     rows = []
+    if vacancy_url:
+        rows.append([InlineKeyboardButton("Открыть оригинал вакансии", url=vacancy_url)])
     # Кнопку отправки не рисуем вовсе, если контакта нет: раньше она была всегда,
     # и нажатие просто выдавало ошибку — бессмысленный клик.
     if has_contact:
@@ -396,11 +419,17 @@ def build_report(score, breakdown, vacancy_text, cover_letter, author, is_fallba
 
 async def send_vacancy_to_admin(bot: Bot, message, score, breakdown, cover_letter, author, is_fallback):
     """Отправляет отчёт о вакансии в чат администратора через Bot API."""
+    username = channel_username_by_chat_id.get(message.chat_id)
+    if username:
+        vacancy_url = f"https://t.me/{username.lstrip('@')}/{message.id}"
+    else:
+        channel_id = str(message.chat_id)
+        vacancy_url = f"https://t.me/c/{channel_id[4:]}/{message.id}" if channel_id.startswith("-100") else None
     await bot.send_message(
         chat_id=ADMIN_CHAT_ID,
         text=build_report(score, breakdown, message.text or "", cover_letter, author, is_fallback),
         parse_mode=ParseMode.HTML,
-        reply_markup=build_keyboard(message.chat_id, message.id, has_contact=bool(author)),
+        reply_markup=build_keyboard(message.chat_id, message.id, has_contact=bool(author), vacancy_url=vacancy_url),
         disable_web_page_preview=True,
     )
 
@@ -551,7 +580,7 @@ def build_stats_report():
             lines.append(f"• {label}: <b>{cnt}</b>")
 
     if s["gemini_fallback"]:
-        lines.append(f"\n⚠️ Писем по шаблону из-за сбоев Gemini: <b>{s['gemini_fallback']}</b>")
+        lines.append(f"\n⚠️ Писем по шаблону из-за сбоев ИИ: <b>{s['gemini_fallback']}</b>")
 
     if s["recent_rejected"]:
         lines.append(f"\n<b>Последние отклонённые на Уровне 2</b> (последние {len(s['recent_rejected'])}):")
@@ -672,6 +701,15 @@ async def safe_edit(query, text, reply_markup=None):
     сеть моргнула). Раньше такое исключение всплывало наружу уже ПОСЛЕ
     отправки резюме и попадало в лог как ошибка отправки, хотя резюме ушло.
     """
+    navigation = []
+    markup = getattr(getattr(query, "message", None), "reply_markup", None)
+    if markup:
+        navigation = [[button for button in row if (button.callback_data or "").startswith("scan:")]
+                      for row in markup.inline_keyboard]
+        navigation = [row for row in navigation if row]
+    if navigation:
+        rows = list(reply_markup.inline_keyboard) if reply_markup else []
+        reply_markup = InlineKeyboardMarkup(rows + navigation)
     try:
         await query.edit_message_text(
             text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
@@ -752,7 +790,7 @@ async def main(mode="normal"):
     ptb_app.add_handler(CommandHandler("start", start_handler))
     ptb_app.add_handler(CommandHandler("ping", ping_handler))
     ptb_app.add_handler(CommandHandler("stats", stats_handler))
-    scanner = HistoryScanner(client, config["telegram"]["channels"], handle_message, ADMIN_CHAT_ID)
+    scanner = HistoryScanner(client, config["telegram"]["channels"], handle_message, ADMIN_CHAT_ID, conn=db.conn)
     scanner.register(ptb_app)
     hh_service = LetterService(db.conn, RESUME_PATH, get_ai_gateway(), config.get("cover_letters", {}))
     def use_uploaded_resume(path):
@@ -825,14 +863,15 @@ async def main(mode="normal"):
                 def get_bot(self):
                     return bot
 
-                async def reply_text(self, text):
-                    return await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+                async def reply_text(self, text, **kwargs):
+                    return await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, **kwargs)
 
             await scanner.start(AdminScanMessage(), SimpleNamespace(application=ptb_app),
                                 days=2, since=yesterday_start)
 
         log.info("Бот запущен. Мониторим новые вакансии в реальном времени...")
         await client.run_until_disconnected()
+        await notify_shutdown("Telethon-клиент отключился от Telegram (потеряна сессия или соединение).")
     finally:
         log.info("Останавливаю Admin Bot...")
         if ptb_app.updater.running:
@@ -853,10 +892,18 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    signal.signal(signal.SIGTERM, _raise_on_sigterm)
+
     try:
         client.loop.run_until_complete(main(mode=args.mode))
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as e:
         log.info("Остановлено пользователем.")
+        reason = "получен сигнал SIGTERM (остановка сервиса/контейнера)." if str(e) == "SIGTERM" \
+            else "остановлен вручную (Ctrl+C)."
+        try:
+            client.loop.run_until_complete(notify_shutdown(reason))
+        except Exception:
+            pass
     except Exception:
         # log.exception уже уйдёт через TelegramAlertHandler, НО только если в
         # момент вызова ещё есть запущенный event loop — а к этому моменту
@@ -872,4 +919,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
-        

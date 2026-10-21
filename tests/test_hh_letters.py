@@ -14,6 +14,14 @@ from hh_handlers import HHHandlers
 
 
 class PreparationTests(unittest.TestCase):
+    def test_regional_links_without_scheme_and_pasted_markdown(self):
+        for url in ('tashkent.hh.uz/vacancy/123?from=search&hhtmFrom=main#top',
+                    'Посмотри эту вакансию: https://tashkent.hh.uz/vacancy/123?utm_source=telegram',
+                    '[Вакансия](https://hh.ru/vacancy/123?from=search)',
+                    'https://almaty.hh.kz/vacancy/123.'):
+            with self.subTest(url=url):
+                self.assertEqual(vacancy_id(url), '123')
+
     def test_only_expected_hh_urls(self):
         self.assertEqual(vacancy_id('https://hh.uz/vacancy/123?from=search#top'), '123')
         for url in ('https://hh.uz.evil.com/vacancy/123', 'http://hh.uz/vacancy/123',
@@ -33,6 +41,27 @@ class PreparationTests(unittest.TestCase):
 
 
 class HHFetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_api_403_falls_back_to_structured_public_page(self):
+        def respond(request):
+            if request.url.host == 'api.hh.ru':
+                return httpx.Response(403)
+            self.assertEqual(str(request.url), 'https://hh.uz/vacancy/123')
+            job = {'@graph': [{'@type': 'JobPosting', 'title': 'Frontend',
+                'hiringOrganization': {'name': 'Company'}, 'description': '<p>Vue &amp; Nuxt required</p>'}]}
+            return httpx.Response(200, text='<html><script type="application/ld+json">' + json.dumps(job) + '</script></html>')
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        with patch('hh_letters.httpx.AsyncClient', return_value=client):
+            result = await fetch_vacancy('123', 'TestBot/1.0')
+        self.assertEqual(result['description'], 'Vue & Nuxt required')
+        self.assertEqual(result['company'], 'Company')
+
+    async def test_captcha_page_is_not_used_as_vacancy(self):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request:
+            httpx.Response(403) if request.url.host == 'api.hh.ru' else httpx.Response(200, text='<h1>Captcha</h1>')))
+        with patch('hh_letters.httpx.AsyncClient', return_value=client):
+            with self.assertRaisesRegex(ValueError, 'Пришлите текст'):
+                await fetch_vacancy('123', 'TestBot/1.0')
+
     async def test_only_fixed_api_endpoint_and_normalized_fields(self):
         def respond(request):
             self.assertEqual(str(request.url), 'https://api.hh.ru/vacancies/123')

@@ -1,13 +1,17 @@
-"""One async queue for every Gemini caller; no worker thread survives a timeout."""
+"""One async queue for every AI caller; no worker thread survives a timeout."""
 import asyncio
 import logging
 import time
 
 log = logging.getLogger("vacancy_bot")
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 
 
 class AIGateway:
     def __init__(self, client, config, counter):
+        self.provider = config.get("provider", "gemini").strip().lower()
+        if self.provider not in ("gemini", "openrouter"):
+            raise ValueError("ai.provider должен быть gemini или openrouter")
         self.client = client
         self.config = config
         self.counter = counter
@@ -16,7 +20,9 @@ class AIGateway:
 
     @property
     def model(self):
-        return self.config.get("model", "gemini-3.6-flash")
+        if self.provider == "openrouter":
+            return self.config.get("openrouter_model") or "openrouter/free"
+        return self.config.get("model") or DEFAULT_GEMINI_MODEL
 
     async def generate(self, prompt, system=None, max_output_tokens=700):
         async with self.lock:
@@ -29,9 +35,13 @@ class AIGateway:
                     if system:
                         options["system_instruction"] = system
                     self.counter("ai_requests")
+                    if self.provider == "openrouter":
+                        request = self.client.generate(self.model, prompt, system, max_output_tokens)
+                    else:
+                        request = self.client.aio.models.generate_content(
+                            model=self.model, contents=prompt, config=options)
                     response = await asyncio.wait_for(
-                        self.client.aio.models.generate_content(
-                            model=self.model, contents=prompt, config=options),
+                        request,
                         timeout=float(self.config.get("timeout_sec", 45)),
                     )
                     usage = getattr(response, "usage_metadata", None)
@@ -51,7 +61,11 @@ class AIGateway:
                     code = getattr(exc, "code", None)
                     if code not in (429, 500, 502, 503, 504) or attempt == 2:
                         raise
-                    log.warning("Gemini временно недоступен: code=%s, попытка=%s", code, attempt + 1)
-                    await asyncio.sleep(2 ** (attempt + 1))
+                    log.warning("%s временно недоступен: code=%s, попытка=%s", self.provider, code, attempt + 1)
+                    retry_after = getattr(exc, "retry_after", None) or 0
+                    # Do not hold the shared queue through a daily quota reset.
+                    if retry_after > 60:
+                        raise
+                    await asyncio.sleep(max(2 ** (attempt + 1), retry_after))
                 finally:
                     self.last_call = time.monotonic()

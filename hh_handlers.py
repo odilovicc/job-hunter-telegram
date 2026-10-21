@@ -50,7 +50,7 @@ class HHHandlers:
             return
         context.user_data["hh_waiting"] = True
         await update.effective_message.reply_text(
-            "Пришлите ссылку https://hh.uz/vacancy/… или текст вакансии.\n"
+            "Пришлите ссылку HH (в том числе tashkent.hh.uz, hh.ru или hh.kz) или текст вакансии.\n"
             "Первый раз проверьте резюме через /resume. Отмена ввода: /cancel.", reply_markup=MENU)
 
     async def cancel(self, update, context):
@@ -173,12 +173,22 @@ class HHHandlers:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("HH letter %s failed (%s)", identifier, type(exc).__name__)
+            log.warning("HH letter %s failed provider=%s model=%s code=%s (%s)", identifier,
+                        getattr(self.service.gateway, "provider", "gemini"), self.service.gateway.model,
+                        getattr(exc, "code", None), type(exc).__name__)
             reason = ""
             if getattr(exc, "code", None) == 429:
-                reason = "Gemini ограничил запросы или исчерпана квота. "
+                reason = "ИИ-провайдер ограничил запросы или исчерпана квота. "
+            elif getattr(exc, "code", None) in (401, 403):
+                reason = "Проверьте API-ключ и доступ к модели в настройках ИИ. "
+            elif getattr(exc, "code", None) == 402:
+                reason = "Проверьте квоту и баланс ИИ-провайдера или выберите бесплатную модель. "
+            elif getattr(exc, "code", None) == 404:
+                reason = "Выбранная модель ИИ недоступна. Проверьте название модели в настройках. "
+            elif getattr(exc, "code", None) in (500, 502, 503, 504):
+                reason = "Сервис ИИ временно недоступен после повторных попыток. Повторите позже. "
             elif isinstance(exc, asyncio.TimeoutError):
-                reason = "Gemini не ответил вовремя. "
+                reason = "ИИ-провайдер не ответил вовремя. "
             elif isinstance(exc, ValueError):
                 reason = str(exc) + " "
             await message.reply_text(
@@ -199,7 +209,7 @@ class HHHandlers:
         if not context.user_data.get("hh_waiting"):
             return
         try:
-            if text.startswith(("https://", "http://")):
+            if text.startswith(("https://", "http://")) or re.search(r"(?:[a-z0-9-]+\.)*hh\.(?:uz|ru|kz)/vacancy/", text, re.I):
                 identifier = vacancy_id(text)
                 vacancy = await fetch_vacancy(identifier, self.service.config.get("hh_user_agent", "PersonalLetterBot/1.0"))
             else:
