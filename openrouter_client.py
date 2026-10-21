@@ -5,16 +5,19 @@ from types import SimpleNamespace
 import httpx
 
 
-def classify_404(response):
-    """Коротко называет причину 404, не отдавая наружу текст ответа.
+def classify_error(response):
+    """Коротко называет причину 401/403/404, не отдавая наружу текст ответа.
 
-    - not_json: ответил не OpenRouter (Cloudflare Worker без маршрута /openrouter/, не тот URL);
+    - not_json: ответил не OpenRouter (Worker без маршрута /openrouter/ или с неверным
+      proxy_token — он отвечает текстом «Forbidden»/«Not found», не тот URL);
     - data_policy: настройки приватности OpenRouter запрещают бесплатные модели;
     - model: OpenRouter не нашёл модель или эндпоинт для неё (например, embedding-модель)."""
     try:
         message = str((response.json().get('error') or {}).get('message', '')).lower()
     except (ValueError, AttributeError):
         return 'not_json'
+    if response.status_code != 404:
+        return 'openrouter'
     return 'data_policy' if 'data policy' in message or 'privacy' in message else 'model'
 
 
@@ -55,7 +58,7 @@ class OpenRouterClient:
             except ValueError:
                 retry_after = 0
             raise OpenRouterError(response.status_code, retry_after,
-                                  classify_404(response) if response.status_code == 404 else None)
+                                  classify_error(response) if response.status_code in (401, 403, 404) else None)
         data = response.json()
         if data.get('error'):
             try:

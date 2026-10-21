@@ -173,16 +173,19 @@ class HHHandlers:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("HH letter %s failed provider=%s model=%s code=%s hint=%s (%s)", identifier,
+            log.warning("HH letter %s failed provider=%s model=%s code=%s hint=%s (%s%s)", identifier,
                         getattr(self.service.gateway, "provider", "gemini"), self.service.gateway.model,
-                        getattr(exc, "code", None), getattr(exc, "hint", None), type(exc).__name__)
+                        getattr(exc, "code", None), getattr(exc, "hint", None), type(exc).__name__,
+                        f": {exc}" if isinstance(exc, ValueError) else "")
             reason = ""
-            if getattr(exc, "code", None) == 429:
+            if getattr(exc, "hint", None) == "not_json":
+                reason = ("Ответил не OpenRouter, а Cloudflare Worker: проверьте, что он обновлён (маршрут /openrouter/), "
+                          "network.cloudflare_worker.base_url верный, а proxy_token совпадает с PROXY_TOKEN в Cloudflare. ")
+            elif getattr(exc, "code", None) == 429:
                 reason = "ИИ-провайдер ограничил запросы или исчерпана квота. "
             elif getattr(exc, "code", None) in (401, 403):
-                reason = "Проверьте API-ключ и доступ к модели в настройках ИИ. "
-            elif getattr(exc, "hint", None) == "not_json":
-                reason = "Ответил не OpenRouter: проверьте, что Cloudflare Worker обновлён (маршрут /openrouter/) и network.cloudflare_worker.base_url верный. "
+                reason = ("OpenRouter отклонил API-ключ: проверьте ai.openrouter_api_key и переменную окружения "
+                          "OPENROUTER_API_KEY (она приоритетнее конфига). ")
             elif getattr(exc, "hint", None) == "data_policy":
                 reason = "OpenRouter блокирует бесплатные модели настройками приватности: включите их на openrouter.ai/settings/privacy. "
             elif getattr(exc, "hint", None) == "model":

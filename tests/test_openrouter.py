@@ -62,6 +62,13 @@ class OpenRouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(error.exception.hint, hint)
             self.assertNotIn('endpoints', str(error.exception))
 
+    async def test_auth_hint_distinguishes_worker(self):
+        for response, hint in ((httpx.Response(403, text='Forbidden'), 'not_json'),
+                               (httpx.Response(401, json={'error': {'message': 'User not found.'}}), 'openrouter')):
+            with self.subTest(hint=hint), self.assertRaises(OpenRouterError) as error:
+                await self.generate(lambda request, r=response: r)
+            self.assertEqual(error.exception.hint, hint)
+
     async def test_error_inside_success_response(self):
         with self.assertRaises(OpenRouterError) as error:
             await self.generate(lambda request: httpx.Response(200, json={'error': {'code': 403}}))

@@ -11,11 +11,13 @@ globalThis.fetch = async (url, init) => {
   assert.equal(url, 'https://openrouter.ai/api/v1/chat/completions');
   assert.equal(init.headers.get('Authorization'), 'Bearer test-key');
   assert.equal(init.headers.has('X-Proxy-Token'), false);
+  assert.equal(init.headers.has('X-Forwarded-For'), false);
+  assert.equal(init.headers.has('CF-IPCountry'), false);
   assert.equal(await new Response(init.body).text(), '{"model":"openrouter/free"}');
   return new Response('{"choices":[]}', { status: 200 });
 };
 const response = await worker.fetch(new Request('https://worker.example/openrouter/api/v1/chat/completions', {
-  method: 'POST', headers: { 'X-Proxy-Token': 'secret', Authorization: 'Bearer test-key' },
+  method: 'POST', headers: { 'X-Proxy-Token': 'secret', Authorization: 'Bearer test-key', 'X-Forwarded-For': '1.2.3.4', 'CF-IPCountry': 'RU' },
   body: '{"model":"openrouter/free"}',
 }), { PROXY_TOKEN: 'secret' });
 assert.equal(response.status, 200);

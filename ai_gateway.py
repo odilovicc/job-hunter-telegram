@@ -31,7 +31,10 @@ class AIGateway:
                 if delay > 0:
                     await asyncio.sleep(delay)
                 try:
-                    options = {"max_output_tokens": max_output_tokens}
+                    # У Gemini 3.x токены размышлений входят в max_output_tokens: при лимите
+                    # ~1000 они съедают весь бюджет и письмо обрывается (MAX_TOKENS).
+                    # Длину письма ограничивает промпт, поэтому добавляем запас сверху.
+                    options = {"max_output_tokens": max_output_tokens + int(self.config.get("thinking_headroom", 4000))}
                     if system:
                         options["system_instruction"] = system
                     self.counter("ai_requests")
