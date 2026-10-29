@@ -9,7 +9,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from ai_gateway import AIGateway
-from hh_letters import LetterService, digest, plain_html, select_blocks, vacancy_id, fetch_vacancy
+from datetime import datetime, timezone
+
+from hh_letters import (LetterService, age_days, digest, plain_html, select_blocks, skill_match,
+                        vacancy_id, fetch_vacancy)
 from hh_handlers import HHHandlers
 
 
@@ -38,6 +41,19 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(select_blocks(['Python: other', 'Vue.js: shipped project'], 'Vue', 25),
                          ['Vue.js: shipped project'])
         self.assertEqual(select_blocks(['a' * 100], '', 10), [])
+
+    def test_skill_match_uses_aliases_and_whole_words(self):
+        matched, missing = skill_match(['Vue', 'REST API', 'Go', 'Kubernetes'],
+                                       ['Vue.js project', 'Built REST API in Google Cloud'])
+        self.assertEqual(matched, ['Vue', 'REST API'])
+        self.assertEqual(missing, ['Go', 'Kubernetes'])
+
+    def test_age_days_accepts_hh_and_json_ld_formats(self):
+        now = datetime(2026, 10, 29, 12, tzinfo=timezone.utc)
+        self.assertEqual(age_days('2026-10-01T10:00:00+0300', now), 28)
+        self.assertEqual(age_days('2026-10-22', now), 7)
+        self.assertIsNone(age_days('', now))
+        self.assertIsNone(age_days('вчера', now))
 
 
 class HHFetchTests(unittest.IsolatedAsyncioTestCase):
@@ -74,6 +90,7 @@ class HHFetchTests(unittest.IsolatedAsyncioTestCase):
             result = await fetch_vacancy('123', 'TestBot/1.0')
         self.assertEqual(result['description'], 'Vue required')
         self.assertNotIn('branded_description', result)
+        self.assertEqual(result['published_at'], '')
 
     async def test_unavailable_hh_offers_text_input(self):
         client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(403)))
@@ -115,6 +132,25 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.gateway.model = 'other-model'
         new_model, _ = await self.service.create(self.vacancy)
         self.assertEqual(len({job, changed, new_model}), 3)
+
+    async def test_stale_vacancy_sets_timing_without_leaking_date(self):
+        fresh, _ = await self.service.create(dict(self.vacancy, published_at=datetime.now(timezone.utc).strftime('%Y-%m-%d')))
+        stale, _ = await self.service.create(dict(self.vacancy, published_at='2020-01-01T10:00:00+0300'))
+        prompts = [json.loads(self.service.get(job)['prompt']) for job in (fresh, stale)]
+        self.assertEqual([p['timing'] for p in prompts], ['normal', 'stale'])
+        self.assertNotIn('published_at', prompts[1]['vacancy'])
+
+    async def test_skill_match_reads_approved_profile(self):
+        self.assertEqual(await self.service.skill_match(dict(self.vacancy, skills=['Vue', 'PHP'])), (['Vue'], ['PHP']))
+
+    async def test_letter_is_sent_copyable(self):
+        self.gateway.generate.return_value = 'Vue & <Nuxt>'
+        job, _ = await self.service.create(self.vacancy)
+        message = SimpleNamespace(reply_text=AsyncMock())
+        await HHHandlers(self.service, 123).deliver(message, job)
+        sent = message.reply_text.await_args
+        self.assertEqual(sent.args[0], '<pre>Vue &amp; &lt;Nuxt&gt;</pre>')
+        self.assertEqual(sent.kwargs['parse_mode'], 'HTML')
 
     async def test_unapproved_resume_never_calls_ai(self):
         self.conn.execute('UPDATE hh_profiles SET approved=0')

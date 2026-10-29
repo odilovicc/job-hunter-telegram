@@ -1,18 +1,23 @@
 """Private Telegram conversation for manual HH letters."""
 import asyncio
+import html
 import json
 import logging
 import tempfile
 import time
 import traceback
 import re
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.error import TimedOut
 from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from hh_letters import fetch_vacancy, vacancy_id, read_resume
+from resume_format import render, split_messages
 
 log = logging.getLogger("vacancy_bot")
 def safe_traceback(exc):
@@ -79,9 +84,8 @@ class HHHandlers:
         await update.effective_message.reply_text(
             "Факты, извлечённые из PDF локально. Проверьте текст: только эти данные будут основой письма. "
             "Чтобы обновить резюме, пришлите сюда новый PDF файлом (до 10 МБ, 30 страниц).")
-        text = "\n".join(profile["facts"])
-        for offset in range(0, len(text), 3500):
-            await update.effective_message.reply_text(text[offset:offset + 3500])
+        for chunk in split_messages(render(profile["facts"])):
+            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
         context.user_data["hh_profile_hash"] = profile["hash"]
         await update.effective_message.reply_text(
             "Профиль подтверждён." if profile["approved"] else "Данные извлечены верно?",
@@ -169,7 +173,8 @@ class HHHandlers:
             buttons.append([InlineKeyboardButton("Сделать короче", callback_data=f"hh:short:{identifier}"),
                             InlineKeyboardButton("Переписать", callback_data=f"hh:rewrite:{identifier}")])
             await message.reply_text("Готово · из кеша" if cached else "Письмо готово", reply_markup=InlineKeyboardMarkup(buttons))
-            await message.reply_text(letter)
+            # <pre> gives Telegram's tap-to-copy button.
+            await message.reply_text(f"<pre>{html.escape(letter)}</pre>", parse_mode=ParseMode.HTML)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -207,6 +212,19 @@ class HHHandlers:
         finally:
             self.active.discard(identifier)
 
+    async def summary(self, vacancy):
+        lines = []
+        if vacancy.get("skills"):
+            matched, missing = await self.service.skill_match(vacancy)
+            if matched:
+                lines.append("Совпало: " + ", ".join(matched))
+            if missing:
+                lines.append("Нет в резюме: " + ", ".join(missing))
+        now = datetime.now(ZoneInfo(self.service.config.get("timezone", "Asia/Tashkent")))
+        if now.hour >= int(self.service.config.get("late_hour", 19)) or now.hour < 8:
+            lines.append(f"Сейчас {now:%H:%M} — отклик лучше отправить утром.")
+        return lines
+
     async def text(self, update, context):
         if not self.allowed(update):
             return
@@ -234,8 +252,12 @@ class HHHandlers:
             log.warning("HH preparation failed (%s)", type(exc).__name__)
             await update.effective_message.reply_text("Не удалось подготовить данные. Проверьте /resume; если HH недоступен, пришлите текст вакансии.")
             return
-        await update.effective_message.reply_text(
-            f"Письмо №{identifier} в очереди." + (" Длинное описание сокращено по смысловым пунктам." if compacted else ""))
+        lines = [f"Письмо №{identifier} в очереди." + (" Длинное описание сокращено по смысловым пунктам." if compacted else "")]
+        try:
+            lines += await self.summary(vacancy)
+        except Exception as exc:
+            log.warning("HH summary failed (%s)", type(exc).__name__)
+        await update.effective_message.reply_text("\n".join(lines))
         context.application.create_task(self.deliver(update.effective_message, identifier), update=update)
 
     async def callback(self, update, context):
