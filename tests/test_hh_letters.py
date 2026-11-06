@@ -196,6 +196,46 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.create(self.vacancy)
         self.gateway.generate.assert_not_awaited()
 
+    async def test_wishes_reach_prompt_and_survive_variants(self):
+        plain, _ = await self.service.create(self.vacancy)
+        job, _ = await self.service.create(self.vacancy, wishes='Упомяни опыт с Nuxt')
+        self.assertNotEqual(plain, job)
+        self.assertNotIn('candidate_wishes', json.loads(self.service.get(plain)['prompt']))
+        self.assertEqual(json.loads(self.service.get(job)['prompt'])['candidate_wishes'], 'Упомяни опыт с Nuxt')
+        await self.service.generate(job)
+        short, _ = await self.service.create(self.vacancy, 'short', self.service.get(job))
+        self.assertEqual(json.loads(self.service.get(short)['prompt'])['candidate_wishes'], 'Упомяни опыт с Nuxt')
+
+    def chat(self, text=None, data=None):
+        message = SimpleNamespace(text=text, reply_text=AsyncMock())
+        query = SimpleNamespace(data=data, answer=AsyncMock(), edit_message_reply_markup=AsyncMock()) if data else None
+        return SimpleNamespace(effective_user=SimpleNamespace(id=123), effective_chat=SimpleNamespace(id=123),
+                               effective_message=message, callback_query=query)
+
+    async def test_bot_asks_for_wishes_before_queueing(self):
+        handler = HHHandlers(self.service, 123)
+        handler.deliver = AsyncMock()
+        context = SimpleNamespace(user_data={'hh_waiting': True},
+                                  application=SimpleNamespace(create_task=lambda coro, update=None: coro.close()))
+        text = 'Требования: Vue. Обязанности: разрабатывать интерфейсы и поддерживать дизайн-систему компании.'
+        update = self.chat(text)
+        await handler.text(update, context)
+        markup = update.effective_message.reply_text.await_args.kwargs['reply_markup']
+        self.assertEqual(markup.inline_keyboard[0][0].text, 'Нет')
+        self.assertIsNone(self.conn.execute('SELECT id FROM hh_letters').fetchone())
+        # Stale token is rejected, the current one queues without wishes.
+        await handler.callback(self.chat(data='hh:nowish:99'), context)
+        self.assertIsNone(self.conn.execute('SELECT id FROM hh_letters').fetchone())
+        await handler.callback(self.chat(data=markup.inline_keyboard[0][0].callback_data), context)
+        prompt = json.loads(self.conn.execute('SELECT prompt FROM hh_letters').fetchone()[0])
+        self.assertNotIn('candidate_wishes', prompt)
+        # Typed reply becomes wishes.
+        await handler.text(self.chat(text + ' Плюс.'), context)
+        await handler.text(self.chat('Сделай акцент на дизайн-системах'), context)
+        rows = self.conn.execute('SELECT prompt FROM hh_letters ORDER BY id').fetchall()
+        self.assertEqual(json.loads(rows[-1][0])['candidate_wishes'], 'Сделай акцент на дизайн-системах')
+        self.assertNotIn('hh_pending', context.user_data)
+
     async def test_no_access_in_other_chats(self):
         handler = HHHandlers(self.service, 123)
         for user, chat in [(123, 42), (42, 123), (42, 42)]:

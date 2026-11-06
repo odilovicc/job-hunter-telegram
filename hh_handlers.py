@@ -28,6 +28,8 @@ def safe_traceback(exc):
 
 
 MENU = ReplyKeyboardMarkup([["✉️ Письмо для HH", "📄 Мой профиль"], ["🔎 Скан истории"]], resize_keyboard=True)
+MENU_LABELS = {"✉️ Письмо для HH", "📄 Мой профиль", "🔎 Скан истории"}
+MAX_WISHES = 1000
 
 
 class HHHandlers:
@@ -61,6 +63,7 @@ class HHHandlers:
     async def cancel(self, update, context):
         if self.allowed(update):
             context.user_data.pop("hh_waiting", None)
+            context.user_data.pop("hh_pending", None)
             await update.effective_message.reply_text("Ввод вакансии отменён. Уже поставленные задачи остаются в очереди.")
 
     async def profile(self, update, context):
@@ -229,14 +232,23 @@ class HHHandlers:
         if not self.allowed(update):
             return
         text = update.effective_message.text.strip()
+        if text in MENU_LABELS:
+            context.user_data.pop("hh_pending", None)
         if text == "✉️ Письмо для HH":
             return await self.start(update, context)
         if text == "📄 Мой профиль":
             return await self.profile(update, context)
         if not context.user_data.get("hh_waiting"):
             return
+        is_link = text.startswith(("https://", "http://")) or re.search(r"(?:[a-z0-9-]+\.)*hh\.(?:uz|ru|kz)/vacancy/", text, re.I)
+        if context.user_data.get("hh_pending") and not is_link and text not in MENU_LABELS:
+            if len(text) > MAX_WISHES:
+                await update.effective_message.reply_text(
+                    f"Пожелания длиннее {MAX_WISHES} символов. Сократите их или нажмите «Нет».")
+                return
+            return await self.enqueue(update, context, text)
         try:
-            if text.startswith(("https://", "http://")) or re.search(r"(?:[a-z0-9-]+\.)*hh\.(?:uz|ru|kz)/vacancy/", text, re.I):
+            if is_link:
                 identifier = vacancy_id(text)
                 vacancy = await fetch_vacancy(identifier, self.service.config.get("hh_user_agent", "PersonalLetterBot/1.0"))
             else:
@@ -244,7 +256,8 @@ class HHHandlers:
                     raise ValueError("Пришлите текст вакансии от 80 до 20 000 символов.")
                 from hh_letters import digest
                 vacancy = {"id": "text-" + digest(text), "name": "", "company": "", "skills": [], "description": text}
-            identifier, compacted = await self.service.create(vacancy)
+            if not (await self.service.profile())["approved"]:
+                raise ValueError("Сначала проверьте профиль через /resume и подтвердите его.")
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc))
             return
@@ -252,13 +265,39 @@ class HHHandlers:
             log.warning("HH preparation failed (%s)", type(exc).__name__)
             await update.effective_message.reply_text("Не удалось подготовить данные. Проверьте /resume; если HH недоступен, пришлите текст вакансии.")
             return
-        lines = [f"Письмо №{identifier} в очереди." + (" Длинное описание сокращено по смысловым пунктам." if compacted else "")]
+        lines = []
         try:
             lines += await self.summary(vacancy)
         except Exception as exc:
             log.warning("HH summary failed (%s)", type(exc).__name__)
-        await update.effective_message.reply_text("\n".join(lines))
-        context.application.create_task(self.deliver(update.effective_message, identifier), update=update)
+        # Token ties the «Нет» button to this vacancy, so an old button can't queue a newer one.
+        token = context.user_data.get("hh_pending_seq", 0) + 1
+        context.user_data["hh_pending_seq"] = token
+        context.user_data["hh_pending"] = {"vacancy": vacancy, "token": token}
+        lines.append("Есть пожелания к письму? Напишите их сообщением (что подчеркнуть, упомянуть, какой тон) "
+                     "или нажмите «Нет».")
+        await update.effective_message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Нет", callback_data=f"hh:nowish:{token}")]]))
+
+    async def enqueue(self, update, context, wishes=""):
+        pending = context.user_data.pop("hh_pending", None)
+        message = update.effective_message
+        if not pending:
+            await message.reply_text("Вакансия не найдена. Пришлите ссылку HH или текст вакансии заново.")
+            return
+        try:
+            identifier, compacted = await self.service.create(pending["vacancy"], wishes=wishes)
+        except ValueError as exc:
+            await message.reply_text(str(exc))
+            return
+        except Exception as exc:
+            log.warning("HH preparation failed (%s)", type(exc).__name__)
+            await message.reply_text("Не удалось подготовить письмо. Проверьте /resume.")
+            return
+        await message.reply_text(f"Письмо №{identifier} в очереди."
+                                 + (" Пожелания учту." if wishes else "")
+                                 + (" Длинное описание сокращено по смысловым пунктам." if compacted else ""))
+        context.application.create_task(self.deliver(message, identifier), update=update)
 
     async def callback(self, update, context):
         if not self.allowed(update):
@@ -278,6 +317,16 @@ class HHHandlers:
                 await message.reply_text("Профиль сохранён. Пришлите ссылку HH или текст вакансии.", reply_markup=MENU)
                 return
             if len(parts) != 3 or not parts[2].isdigit():
+                return
+            if action == "nowish":
+                pending = context.user_data.get("hh_pending")
+                if not pending or pending["token"] != int(parts[2]):
+                    raise ValueError("Эта вакансия уже обработана или устарела. Пришлите её заново.")
+                try:
+                    await update.callback_query.edit_message_reply_markup(None)
+                except Exception:
+                    pass
+                await self.enqueue(update, context)
                 return
             identifier = int(parts[2])
             if action in ("short", "rewrite"):
