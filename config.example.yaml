@@ -182,3 +182,8 @@ cover_letters:
   vacancy_chars: 5000
   max_prompt_chars: 12000
   max_output_tokens: 1000
+  # Вакансия старше stale_days дней: письмо уточнит, актуальна ли ещё позиция.
+  stale_days: 14
+  # С late_hour до 08:00 бот напомнит отправить отклик утром.
+  timezone: "Asia/Tashkent"
+  late_hour: 19

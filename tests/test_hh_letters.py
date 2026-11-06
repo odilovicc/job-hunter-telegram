@@ -9,7 +9,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from ai_gateway import AIGateway
-from hh_letters import LetterService, digest, plain_html, select_blocks, vacancy_id, fetch_vacancy
+from datetime import datetime, timezone
+
+from hh_letters import (LetterService, age_days, digest, plain_html, select_blocks, skill_match,
+                        vacancy_id, fetch_vacancy)
 from hh_handlers import HHHandlers
 
 
@@ -38,6 +41,19 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(select_blocks(['Python: other', 'Vue.js: shipped project'], 'Vue', 25),
                          ['Vue.js: shipped project'])
         self.assertEqual(select_blocks(['a' * 100], '', 10), [])
+
+    def test_skill_match_uses_aliases_and_whole_words(self):
+        matched, missing = skill_match(['Vue', 'REST API', 'Go', 'Kubernetes'],
+                                       ['Vue.js project', 'Built REST API in Google Cloud'])
+        self.assertEqual(matched, ['Vue', 'REST API'])
+        self.assertEqual(missing, ['Go', 'Kubernetes'])
+
+    def test_age_days_accepts_hh_and_json_ld_formats(self):
+        now = datetime(2026, 10, 29, 12, tzinfo=timezone.utc)
+        self.assertEqual(age_days('2026-10-01T10:00:00+0300', now), 28)
+        self.assertEqual(age_days('2026-10-22', now), 7)
+        self.assertIsNone(age_days('', now))
+        self.assertIsNone(age_days('вчера', now))
 
 
 class HHFetchTests(unittest.IsolatedAsyncioTestCase):
@@ -74,6 +90,7 @@ class HHFetchTests(unittest.IsolatedAsyncioTestCase):
             result = await fetch_vacancy('123', 'TestBot/1.0')
         self.assertEqual(result['description'], 'Vue required')
         self.assertNotIn('branded_description', result)
+        self.assertEqual(result['published_at'], '')
 
     async def test_unavailable_hh_offers_text_input(self):
         client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(403)))
@@ -115,6 +132,25 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.gateway.model = 'other-model'
         new_model, _ = await self.service.create(self.vacancy)
         self.assertEqual(len({job, changed, new_model}), 3)
+
+    async def test_stale_vacancy_sets_timing_without_leaking_date(self):
+        fresh, _ = await self.service.create(dict(self.vacancy, published_at=datetime.now(timezone.utc).strftime('%Y-%m-%d')))
+        stale, _ = await self.service.create(dict(self.vacancy, published_at='2020-01-01T10:00:00+0300'))
+        prompts = [json.loads(self.service.get(job)['prompt']) for job in (fresh, stale)]
+        self.assertEqual([p['timing'] for p in prompts], ['normal', 'stale'])
+        self.assertNotIn('published_at', prompts[1]['vacancy'])
+
+    async def test_skill_match_reads_approved_profile(self):
+        self.assertEqual(await self.service.skill_match(dict(self.vacancy, skills=['Vue', 'PHP'])), (['Vue'], ['PHP']))
+
+    async def test_letter_is_sent_copyable(self):
+        self.gateway.generate.return_value = 'Vue & <Nuxt>'
+        job, _ = await self.service.create(self.vacancy)
+        message = SimpleNamespace(reply_text=AsyncMock())
+        await HHHandlers(self.service, 123).deliver(message, job)
+        sent = message.reply_text.await_args
+        self.assertEqual(sent.args[0], '<pre>Vue &amp; &lt;Nuxt&gt;</pre>')
+        self.assertEqual(sent.kwargs['parse_mode'], 'HTML')
 
     async def test_unapproved_resume_never_calls_ai(self):
         self.conn.execute('UPDATE hh_profiles SET approved=0')
@@ -159,6 +195,46 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await self.service.create(self.vacancy)
         self.gateway.generate.assert_not_awaited()
+
+    async def test_wishes_reach_prompt_and_survive_variants(self):
+        plain, _ = await self.service.create(self.vacancy)
+        job, _ = await self.service.create(self.vacancy, wishes='Упомяни опыт с Nuxt')
+        self.assertNotEqual(plain, job)
+        self.assertNotIn('candidate_wishes', json.loads(self.service.get(plain)['prompt']))
+        self.assertEqual(json.loads(self.service.get(job)['prompt'])['candidate_wishes'], 'Упомяни опыт с Nuxt')
+        await self.service.generate(job)
+        short, _ = await self.service.create(self.vacancy, 'short', self.service.get(job))
+        self.assertEqual(json.loads(self.service.get(short)['prompt'])['candidate_wishes'], 'Упомяни опыт с Nuxt')
+
+    def chat(self, text=None, data=None):
+        message = SimpleNamespace(text=text, reply_text=AsyncMock())
+        query = SimpleNamespace(data=data, answer=AsyncMock(), edit_message_reply_markup=AsyncMock()) if data else None
+        return SimpleNamespace(effective_user=SimpleNamespace(id=123), effective_chat=SimpleNamespace(id=123),
+                               effective_message=message, callback_query=query)
+
+    async def test_bot_asks_for_wishes_before_queueing(self):
+        handler = HHHandlers(self.service, 123)
+        handler.deliver = AsyncMock()
+        context = SimpleNamespace(user_data={'hh_waiting': True},
+                                  application=SimpleNamespace(create_task=lambda coro, update=None: coro.close()))
+        text = 'Требования: Vue. Обязанности: разрабатывать интерфейсы и поддерживать дизайн-систему компании.'
+        update = self.chat(text)
+        await handler.text(update, context)
+        markup = update.effective_message.reply_text.await_args.kwargs['reply_markup']
+        self.assertEqual(markup.inline_keyboard[0][0].text, 'Нет')
+        self.assertIsNone(self.conn.execute('SELECT id FROM hh_letters').fetchone())
+        # Stale token is rejected, the current one queues without wishes.
+        await handler.callback(self.chat(data='hh:nowish:99'), context)
+        self.assertIsNone(self.conn.execute('SELECT id FROM hh_letters').fetchone())
+        await handler.callback(self.chat(data=markup.inline_keyboard[0][0].callback_data), context)
+        prompt = json.loads(self.conn.execute('SELECT prompt FROM hh_letters').fetchone()[0])
+        self.assertNotIn('candidate_wishes', prompt)
+        # Typed reply becomes wishes.
+        await handler.text(self.chat(text + ' Плюс.'), context)
+        await handler.text(self.chat('Сделай акцент на дизайн-системах'), context)
+        rows = self.conn.execute('SELECT prompt FROM hh_letters ORDER BY id').fetchall()
+        self.assertEqual(json.loads(rows[-1][0])['candidate_wishes'], 'Сделай акцент на дизайн-системах')
+        self.assertNotIn('hh_pending', context.user_data)
 
     async def test_no_access_in_other_chats(self):
         handler = HHHandlers(self.service, 123)
