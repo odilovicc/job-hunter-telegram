@@ -13,10 +13,11 @@ from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import TimedOut
+from telegram.error import BadRequest, TimedOut
 from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from hh_letters import fetch_vacancy, vacancy_id, read_resume
+from mailer import MailError, find_emails, valid_email
 from resume_format import render, split_messages
 
 log = logging.getLogger("vacancy_bot")
@@ -27,17 +28,26 @@ def safe_traceback(exc):
     return re.sub(r"\b\d+:[A-Za-z0-9_-]{20,}", "[bot token redacted]", text)
 
 
-MENU = ReplyKeyboardMarkup([["✉️ Письмо для HH", "📄 Мой профиль"], ["🔎 Скан истории"]], resize_keyboard=True)
-MENU_LABELS = {"✉️ Письмо для HH", "📄 Мой профиль", "🔎 Скан истории"}
+RESUME_BUTTON = "📎 Моё резюме"
+MENU = ReplyKeyboardMarkup([["✉️ Письмо для HH", "📄 Мой профиль"], [RESUME_BUTTON, "🔎 Скан истории"]],
+                           resize_keyboard=True)
+MENU_LABELS = {"✉️ Письмо для HH", "📄 Мой профиль", RESUME_BUTTON, "🔎 Скан истории"}
 MAX_WISHES = 1000
+MAIL_SETUP = ("Почта не настроена. В config.yaml заполните секцию email: gmail_address и app_password "
+              "(пароль приложения: myaccount.google.com/apppasswords, нужна двухэтапная аутентификация), "
+              "затем перезапустите бота.")
 
 
 class HHHandlers:
-    def __init__(self, service, admin_id, upload_path=None, on_resume_saved=None):
+    def __init__(self, service, admin_id, upload_path=None, on_resume_saved=None, mailer=None, outbox=None):
         self.service, self.admin_id = service, admin_id
         self.active = set()
         self.upload_path = Path(upload_path or service.resume_path)
         self.on_resume_saved = on_resume_saved
+        self.mailer, self.outbox = mailer, outbox
+        # (path, mtime, size) -> file_id: повторная отправка резюме мгновенная,
+        # без перезаливки; новый PDF меняет ключ и загружается заново.
+        self.resume_file = None
 
     def allowed(self, update):
         return (update.effective_user and update.effective_user.id == self.admin_id
@@ -48,6 +58,7 @@ class HHHandlers:
         app.add_handler(CommandHandler("resume", self.profile))
         app.add_handler(CommandHandler("letters", self.jobs))
         app.add_handler(CommandHandler("cancel", self.cancel))
+        app.add_handler(CommandHandler("cv", self.send_resume))
         app.add_handler(CallbackQueryHandler(self.callback, pattern=r"^hh:"))
         app.add_handler(MessageHandler(filters.Document.ALL, self.upload_resume))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text))
@@ -64,6 +75,7 @@ class HHHandlers:
         if self.allowed(update):
             context.user_data.pop("hh_waiting", None)
             context.user_data.pop("hh_pending", None)
+            context.user_data.pop("mail_wait", None)
             await update.effective_message.reply_text("Ввод вакансии отменён. Уже поставленные задачи остаются в очереди.")
 
     async def profile(self, update, context):
@@ -152,6 +164,91 @@ class HHHandlers:
         await update.effective_message.reply_text("Резюме сохранено и будет использоваться для новых откликов, в том числе после перезапуска.")
         await self.profile(update, context)
 
+    @property
+    def resume_filename(self):
+        return getattr(self.mailer, "resume_filename", None) or Path(self.service.resume_path).name
+
+    async def send_resume(self, update, context):
+        """Присылает сам PDF — удобно переслать рекрутеру в любой чат."""
+        if not self.allowed(update):
+            return
+        message = update.effective_message
+        path = Path(self.service.resume_path)
+        try:
+            stat = path.stat()
+        except OSError:
+            await message.reply_text("Резюме не найдено. Пришлите PDF файлом сюда — я сохраню его.")
+            return
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        caption = f"Резюме · обновлено {datetime.fromtimestamp(stat.st_mtime):%d.%m.%Y}"
+        if self.resume_file and self.resume_file[0] == key:
+            try:
+                await message.reply_document(self.resume_file[1], caption=caption, reply_markup=MENU)
+                return
+            except BadRequest:
+                self.resume_file = None  # file_id протух — загрузим заново
+        with path.open("rb") as file:
+            sent = await message.reply_document(file, filename=self.resume_filename, caption=caption,
+                                                reply_markup=MENU, read_timeout=60, write_timeout=60)
+        if sent and sent.document:
+            self.resume_file = (key, sent.document.file_id)
+
+    async def mail_preview(self, message, letter_id, recipient, others=()):
+        """Черновик + превью: письмо уходит только после явного «Отправить»."""
+        job = self.service.get(letter_id)
+        if not job or job["status"] != "done":
+            raise ValueError("Письмо не найдено или ещё не готово.")
+        if not Path(self.service.resume_path).is_file():
+            raise ValueError("Резюме не найдено — нечего прикрепить. Пришлите PDF файлом.")
+        vacancy = json.loads(job["vacancy"])
+        subject = self.mailer.subject(vacancy)
+        draft_id = self.outbox.draft(letter_id, recipient, subject, self.mailer.body(job["letter"]))
+        esc = html.escape
+        lines = [f"<b>Кому:</b> {esc(recipient)}", f"<b>Тема:</b> {esc(subject)}",
+                 f"<b>Вложение:</b> {esc(self.mailer.resume_filename)}",
+                 "<b>Текст:</b> письмо №%d%s" % (letter_id, " + подпись" if self.mailer.signature else "")]
+        if others:
+            lines.append("Ещё адреса в вакансии: " + ", ".join(f"<code>{esc(e)}</code>" for e in others))
+        sent_at = self.outbox.last_sent_to(recipient)
+        if sent_at:
+            lines.append(f"⚠️ На этот адрес уже отправляли отклик {esc(sent_at)} UTC.")
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=self.mail_buttons(draft_id, letter_id))
+
+    @staticmethod
+    def mail_buttons(draft_id, letter_id, send_label="✅ Отправить"):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(send_label, callback_data=f"hh:msend:{draft_id}")],
+            [InlineKeyboardButton("✏️ Другой адрес", callback_data=f"hh:mto:{letter_id}"),
+             InlineKeyboardButton("✖️ Отмена", callback_data=f"hh:mcancel:{draft_id}")]])
+
+    async def mail_send(self, query, draft_id):
+        draft = self.outbox.get(draft_id)
+        if not draft or not self.outbox.claim(draft_id):
+            raise ValueError("Это письмо уже отправлено, отправляется или отменено.")
+        recipient = html.escape(draft["recipient"])
+        await self.edit(query, f"⏳ Отправляю на {recipient}…")
+        try:
+            message_id = await self.mailer.send(draft["recipient"], draft["subject"], draft["body"],
+                                                self.service.resume_path)
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, MailError) else "Не удалось отправить письмо."
+            log.warning("Email draft %s failed (%s)", draft_id, type(exc).__name__)
+            self.outbox.release(draft_id, reason)
+            await self.edit(query, f"❌ {html.escape(reason)}\nКому: {recipient}",
+                            self.mail_buttons(draft_id, draft["letter_id"], "🔁 Повторить"))
+            return
+        self.outbox.mark_sent(draft_id, message_id)
+        log.info("Email draft %s sent letter=%s", draft_id, draft["letter_id"])
+        await self.edit(query, f"✅ Отправлено на {recipient}\nТема: {html.escape(draft['subject'])}\n"
+                               "Копия — в «Отправленных» Gmail.")
+
+    @staticmethod
+    async def edit(query, text, markup=None):
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except BadRequest:
+            await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
     async def jobs(self, update, context):
         if not self.allowed(update):
             return
@@ -175,6 +272,8 @@ class HHHandlers:
                 buttons.append([InlineKeyboardButton("Открыть вакансию", url=f'https://hh.uz/vacancy/{vacancy["id"]}')])
             buttons.append([InlineKeyboardButton("Сделать короче", callback_data=f"hh:short:{identifier}"),
                             InlineKeyboardButton("Переписать", callback_data=f"hh:rewrite:{identifier}")])
+            if self.mailer is not None:
+                buttons.append([InlineKeyboardButton("📧 Отправить на почту", callback_data=f"hh:mail:{identifier}")])
             await message.reply_text("Готово · из кеша" if cached else "Письмо готово", reply_markup=InlineKeyboardMarkup(buttons))
             # <pre> gives Telegram's tap-to-copy button.
             await message.reply_text(f"<pre>{html.escape(letter)}</pre>", parse_mode=ParseMode.HTML)
@@ -234,6 +333,21 @@ class HHHandlers:
         text = update.effective_message.text.strip()
         if text in MENU_LABELS:
             context.user_data.pop("hh_pending", None)
+            context.user_data.pop("mail_wait", None)
+        if text == RESUME_BUTTON:
+            return await self.send_resume(update, context)
+        waiting_mail = context.user_data.get("mail_wait")
+        if waiting_mail and "@" in text and not re.search(r"\s", text):
+            address = re.sub(r"^mailto:", "", text, flags=re.I).strip("<>")
+            if not valid_email(address):
+                await update.effective_message.reply_text("Не похоже на email. Пришлите адрес ещё раз или /cancel.")
+                return
+            context.user_data.pop("mail_wait", None)
+            try:
+                return await self.mail_preview(update.effective_message, waiting_mail, address)
+            except ValueError as exc:
+                await update.effective_message.reply_text(str(exc))
+                return
         if text == "✉️ Письмо для HH":
             return await self.start(update, context)
         if text == "📄 Мой профиль":
@@ -329,6 +443,8 @@ class HHHandlers:
                 await self.enqueue(update, context)
                 return
             identifier = int(parts[2])
+            if action in ("mail", "mto", "msend", "mcancel"):
+                return await self.mail_callback(update, context, action, identifier)
             if action in ("short", "rewrite"):
                 parent = self.service.get(identifier)
                 if not parent or parent["status"] != "done":
@@ -343,3 +459,24 @@ class HHHandlers:
         except Exception as exc:
             log.warning("HH callback failed (%s)", type(exc).__name__)
             await message.reply_text("Не удалось подготовить письмо. Проверьте /resume.")
+
+    async def mail_callback(self, update, context, action, identifier):
+        query, message = update.callback_query, update.effective_message
+        if not (self.mailer and self.outbox and self.mailer.configured):
+            raise ValueError(MAIL_SETUP)
+        if action == "msend":
+            return await self.mail_send(query, identifier)
+        if action == "mcancel":
+            self.outbox.cancel(identifier)
+            return await self.edit(query, "Отправка на почту отменена.")
+        job = self.service.get(identifier)
+        if not job or job["status"] != "done":
+            raise ValueError("Письмо не найдено или ещё не готово.")
+        if action == "mail":
+            vacancy = json.loads(job["vacancy"])
+            found = find_emails(vacancy.get("description", ""), exclude=[self.mailer.address])
+            if found:
+                return await self.mail_preview(message, identifier, found[0], found[1:])
+        context.user_data["mail_wait"] = identifier
+        await message.reply_text(("В вакансии email не найден. " if action == "mail" else "")
+                                 + "Пришлите email получателя одним сообщением. /cancel — отмена.")

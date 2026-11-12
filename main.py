@@ -25,6 +25,7 @@ from ai_generator import create_ai_client, FALLBACK_COVER_LETTER
 from ai_gateway import AIGateway
 from hh_letters import LetterService
 from hh_handlers import HHHandlers, MENU
+from mailer import GmailSender, Outbox
 from resume_storage import resume_path
 from history_scan import HistoryScanner, MessageGate
 
@@ -529,7 +530,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ Бот на связи. Здесь будут появляться подходящие вакансии с кнопками "
         "«Отправить отклик» / «Пропустить».\n"
         "Для пропущенных вакансий — «🔎 Скан истории» или /scan.\n"
-        "Для письма по ссылке HH нажмите кнопку ниже. /resume — профиль, /letters — повтор ошибок.",
+        "Для письма по ссылке HH нажмите кнопку ниже. /resume — профиль, /cv — прислать PDF резюме, "
+        "/letters — повтор ошибок. Готовое письмо можно отправить на почту HR кнопкой «📧».",
         reply_markup=MENU
     )
 
@@ -797,9 +799,13 @@ async def main(mode="normal"):
         global RESUME_PATH
         RESUME_PATH = str(path)
 
+    mailer = GmailSender(config.get("email"))
+    if not mailer.configured:
+        log.info("Почта не настроена (секция email в config.yaml) — кнопка «На почту» подскажет, как включить.")
     HHHandlers(hh_service, ADMIN_CHAT_ID,
                upload_path=os.path.join(BASE_DIR, "uploads", "resume.pdf"),
-               on_resume_saved=use_uploaded_resume).register(ptb_app)
+               on_resume_saved=use_uploaded_resume,
+               mailer=mailer, outbox=Outbox(db.conn)).register(ptb_app)
     ptb_app.add_handler(CallbackQueryHandler(button_handler))
     ptb_app.add_error_handler(error_handler)
 

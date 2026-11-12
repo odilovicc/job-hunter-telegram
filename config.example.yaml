@@ -187,3 +187,23 @@ cover_letters:
   # С late_hour до 08:00 бот напомнит отправить отклик утром.
   timezone: "Asia/Tashkent"
   late_hour: 19
+
+# Отправка готового письма HR на почту из вашего Gmail (кнопка «📧 Отправить на почту»).
+# Нужен ПАРОЛЬ ПРИЛОЖЕНИЯ, не обычный пароль: включите двухэтапную аутентификацию
+# и создайте его на https://myaccount.google.com/apppasswords.
+# Секреты можно не хранить в файле: GMAIL_ADDRESS / GMAIL_APP_PASSWORD в окружении приоритетнее.
+# Письмо уходит через smtp.gmail.com:465 и сохраняется в «Отправленных» Gmail.
+email:
+  gmail_address: ""        # you@gmail.com
+  app_password: ""         # 16 символов, пробелы можно оставить
+  from_name: "Имя Фамилия" # отображаемое имя отправителя
+  # {vacancy} — название вакансии, {company} — компания, {name} — from_name
+  subject_template: "Отклик на вакансию «{vacancy}» — {name}"
+  subject_fallback: "Отклик на вакансию — {name}"  # когда название неизвестно (вставлен текст)
+  resume_filename: "CV_Imya_Familiya.pdf"  # имя вложения вместо безликого resume.pdf
+  signature: |
+    --
+    Имя Фамилия
+    Telegram: @username · +998 00 000-00-00
+    GitHub: github.com/username
+
